@@ -42,6 +42,12 @@ import numpy as np
 import os
 from io import BytesIO
 
+from arm_controller.joint_contract import (
+    HOME_DEGREES,
+    JOINT_NAMES as CONTRACT_JOINT_NAMES,
+    radians_to_servo_degrees,
+)
+
 try:
     import cv2
     CV2_AVAILABLE = True
@@ -572,7 +578,7 @@ class BartenderBehaviorTree(Node):
         
         # Joint state tracking (like arm_gui.py)
         self.joint_names = ['base', 'shoulder', 'elbow', 'forearm', 'wrist', 'gripper']
-        self.current_joint_positions = {name: 90.0 for name in self.joint_names}  # Default 90° = home
+        self.current_joint_positions = dict(zip(self.joint_names, HOME_DEGREES))
         
         # Camera frame for web dashboard
         self.latest_camera_frame = None
@@ -719,20 +725,14 @@ class BartenderBehaviorTree(Node):
     def joint_state_callback(self, msg):
         """Update current joint positions from /joint_states (like arm_gui.py)."""
         try:
-            # Extract joint positions in GUI convention (90° = home)
+            # Convert named URDF feedback through the canonical joint contract.
             for i, name in enumerate(msg.name):
-                if name in self.joint_names:
-                    # Convert from radians to degrees: degrees = radians * 180/pi + 90
-                    # Account for URDF inversion for shoulder and elbow
-                    if name in ['shoulder', 'elbow']:
-                        # These are inverted in URDF
-                        self.current_joint_positions[name] = 90.0 - math.degrees(msg.position[i])
-                    elif name == 'forearm':
-                        # Wrist forearm has special negation
-                        self.current_joint_positions[name] = 90.0 - math.degrees(msg.position[i])
-                    else:
-                        # Normal joints
-                        self.current_joint_positions[name] = 90.0 + math.degrees(msg.position[i])
+                if name in CONTRACT_JOINT_NAMES:
+                    index = CONTRACT_JOINT_NAMES.index(name)
+                    logical_name = self.joint_names[index]
+                    self.current_joint_positions[logical_name] = (
+                        radians_to_servo_degrees(index, msg.position[i])
+                    )
         except Exception as e:
             self.get_logger().warn(f"Error updating joint state: {e}")
     
@@ -759,12 +759,14 @@ class BartenderBehaviorTree(Node):
             joint_order = ['base', 'shoulder', 'elbow', 'forearm', 'wrist', 'gripper']
             
             joint_values = []
-            for joint in joint_order:
+            for index, joint in enumerate(joint_order):
                 if joint in joint_angles_dict:
                     joint_values.append(float(joint_angles_dict[joint]))
                 else:
-                    self.get_logger().warn(f"Joint '{joint}' not found in solution, using 90°")
-                    joint_values.append(90.0)
+                    self.get_logger().warn(
+                        f"Joint '{joint}' not found in solution, using calibrated home"
+                    )
+                    joint_values.append(HOME_DEGREES[index])
             
             # Update current positions for tracking
             for joint, value in zip(joint_order, joint_values):

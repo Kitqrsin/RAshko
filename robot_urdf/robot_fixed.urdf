@@ -2,6 +2,12 @@
 <!-- Generated using onshape-to-robot -->
 <!-- Onshape document_id: 93be7c15a633252e37868d3e -->
 <robot name="robot_urdf">
+  <!-- LLM HANDOFF: inertial roots break KDL; keep this massless parent link. -->
+  <link name="base_footprint"/>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+  </joint>
   <!-- Link compound -->
   <link name="base_link">
     <inertial>
@@ -1562,13 +1568,16 @@
       </geometry>
     </collision>
   </link>
+  <!-- Joint limits are the canonical logical servo ranges expressed around
+       HOME_DEGREES as URDF radians. Keep these synchronized with
+       arm_controller/joint_contract.py and the Pi calibration. -->
   <!-- Joint from gripper to servo_disc_3 -->
   <joint name="gripper_base" type="revolute">
     <origin xyz="0.00249453 0.0161866 -0.0292888" rpy="1.5708 -0.535872 1.5708"/>
     <parent link="gripper_base"/>
     <child link="servo_disc_3"/>
     <axis xyz="0 0 1"/>
-    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+    <limit effort="10" velocity="1.0" lower="0.0" upper="3.141592653589793"/>
   </joint>
   <!-- Joint from open_cascade_step_translator_6_7_1 to gripper -->
   <joint name="wrist_rotate" type="revolute">
@@ -1576,7 +1585,7 @@
     <parent link="wrist_link"/>
     <child link="gripper_base"/>
     <axis xyz="0 0 1"/>
-    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+    <limit effort="10" velocity="2.0" lower="-1.710422666954443" upper="1.4311699866353502"/>
   </joint>
   <!-- Joint from part_1 to open_cascade_step_translator_6_7_1 -->
   <joint name="wrist" type="revolute">
@@ -1584,7 +1593,7 @@
     <parent link="forearm_link"/>
     <child link="wrist_link"/>
     <axis xyz="0 0 1"/>
-    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+    <limit effort="10" velocity="1.5" lower="-1.4660765716752369" upper="1.6755160819145565"/>
   </joint>
   <!-- Joint from servo_disc_2 to part_1 -->
   <joint name="elbow" type="revolute">
@@ -1592,7 +1601,7 @@
     <parent link="upper_arm_link"/>
     <child link="forearm_link"/>
     <axis xyz="0 0 1"/>
-    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+    <limit effort="10" velocity="1.5" lower="-1.5707963267948966" upper="1.5707963267948966"/>
   </joint>
   <!-- Joint from servo_disc to servo_disc_2 -->
   <joint name="shoulder" type="revolute">
@@ -1600,7 +1609,7 @@
     <parent link="shoulder_link"/>
     <child link="upper_arm_link"/>
     <axis xyz="0 0 1"/>
-    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+    <limit effort="10" velocity="1.5" lower="-1.6057029118347832" upper="1.53588974175501"/>
   </joint>
   <!-- Joint from compound to servo_disc -->
   <joint name="base" type="revolute">
@@ -1608,6 +1617,13 @@
     <parent link="base_link"/>
     <child link="shoulder_link"/>
     <axis xyz="0 0 1"/>
-    <limit effort="10" velocity="10" lower="0" upper="4.27605669661414"/>
+    <limit effort="10" velocity="1.5" lower="-1.5707963267948966" upper="2.705260340591211"/>
+  </joint>
+  <!-- Canonical Cartesian target. The gripper geometry extends along local -Z. -->
+  <link name="tool_tip"/>
+  <joint name="tool_tip_fixed" type="fixed">
+    <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+    <parent link="gripper_base"/>
+    <child link="tool_tip"/>
   </joint>
 </robot>

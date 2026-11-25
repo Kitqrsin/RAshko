@@ -38,6 +38,8 @@ from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Float32
 from geometry_msgs.msg import Point
 
+from arm_controller.joint_contract import HOME_DEGREES, SERVO_MAX_DEGREES
+
 # ---------------------------------------------------------------------------
 #  PID Controller
 # ---------------------------------------------------------------------------
@@ -105,7 +107,7 @@ class FaceTrackPIDNode(Node):
     CENTRE_Y = FRAME_H / 2.0   # 120
 
     # Joint indices (must match servo_node convention)
-    J_BASE = 0          # pan   (0-270°)
+    J_BASE = 0          # pan   (0-245° configured logical range)
     J_SHOULDER = 1      # tilt  (0-180°, hardware-inverted by servo_node)
     J_ELBOW = 2
     J_WRIST = 3
@@ -114,11 +116,11 @@ class FaceTrackPIDNode(Node):
     NUM_JOINTS = 6
 
     # Position limits (GUI-space degrees)
-    BASE_MIN, BASE_MAX = 0.0, 270.0
+    BASE_MIN, BASE_MAX = 0.0, SERVO_MAX_DEGREES[0]
     SHOULDER_MIN, SHOULDER_MAX = 0.0, 180.0
 
     # Default "park" angles for joints not under PID control
-    DEFAULT_ANGLES = [90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+    DEFAULT_ANGLES = list(HOME_DEGREES)
 
     def __init__(self):
         super().__init__('face_track_pid')

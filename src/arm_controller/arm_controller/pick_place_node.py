@@ -26,6 +26,8 @@ import time
 import math
 import os
 
+from arm_controller.joint_contract import HOME_DEGREES
+
 try:
     from .ik_solver import ArmIKSolver
 except ImportError:
@@ -390,12 +392,12 @@ class PickPlaceNode(Node):
         """Convert IK solution dict → Float32MultiArray and publish."""
         msg = Float32MultiArray()
         msg.data = [
-            float(angles_dict.get('base', 90)),
-            float(angles_dict.get('shoulder', 90)),
-            float(angles_dict.get('elbow', 90)),
-            float(angles_dict.get('forearm', 90)),
-            float(angles_dict.get('wrist', 90)),
-            float(angles_dict.get('gripper', 90)),
+            float(angles_dict.get('base', HOME_DEGREES[0])),
+            float(angles_dict.get('shoulder', HOME_DEGREES[1])),
+            float(angles_dict.get('elbow', HOME_DEGREES[2])),
+            float(angles_dict.get('forearm', HOME_DEGREES[3])),
+            float(angles_dict.get('wrist', HOME_DEGREES[4])),
+            float(angles_dict.get('gripper', HOME_DEGREES[5])),
         ]
         self.joint_pub.publish(msg)
         self.get_logger().debug(

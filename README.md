@@ -1,435 +1,277 @@
-# 🤖 Jarvis Arm - 6-DOF Robot Arm with MoveIt Integration
+# RAshko 6-DOF arm
 
-A comprehensive robot arm control system powered by Raspberry Pi 5 and ROS2 Humble, featuring real-time servo control, inverse kinematics, motion planning with MoveIt, and a modern GUI interface.
+RAshko is the Windows/Docker half of the robot-arm system. It owns the GUI,
+inverse kinematics, MoveIt planning, vision, trajectory execution, and offline
+simulation. The `Communicator/` project is the Raspberry Pi runtime;
+it owns the PCA9685, receives authenticated six-angle commands, and streams the
+Raspberry Pi Camera Module 2 to the laptop.
 
-## 🎯 Key Highlights
+## Architecture
 
-- **✅ Full MoveIt Integration**: Advanced motion planning with OMPL algorithms
-- **🤖 ROS2 Humble**: Professional robotics middleware
-- **🦾 6-DOF Control**: Base, shoulder, elbow, wrist, wrist_rotate, gripper
-- **📐 Inverse Kinematics**: PyBullet-based IK solver with GUI
-- **🛡️ Safety Features**: Emergency stop, speed control, collision checking
-- **🐳 Docker Containerized**: Isolated ROS2 environment
+```text
+GUI / MoveIt / IK
+        |
+        v
+/joint_commands (six logical degrees)
+        |
+        +-- offline --> simulated servo_node --> /joint_states --> RViz
+        |
+        +-- hardware -> UDP bridge -> Raspberry Pi Communicator -> PCA9685
 
-## 📋 Features
-
-### MoveIt Motion Planning (NEW! ✨)
-- **Collision-Free Planning**: OMPL algorithms (RRTConnect, RRTstar)
-- **Trajectory Execution**: Multi-waypoint paths with timing control
-- **Predefined Poses**: Home, ready, gripper open/closed
-- **Planning Groups**: Arm (5-DOF), gripper, combined arm+gripper
-- **KDL Kinematics**: Fast inverse kinematics solver
-
-### Core Functionality
-- **Real-time Servo Control**: Individual control of 5 servos (S2-S6) with live position feedback
-- **Per-Servo Speed Control**: Adjustable movement speed (10-500ms delay) for each servo independently
-- **Motor Enable/Disable**: Hardware-level motor control via GPIO output enable (OE) pin
-- **Emergency Stop**: Always-accessible stop button for immediate movement interruption
-- **Position Persistence**: Automatic saving of last position on shutdown (Ctrl+C)
-
-### Advanced Features
-- **Custom Pose Management**: Save and recall named positions with SQLite database storage
-- **Pose Chaining System**: Execute up to 5 poses sequentially with 500ms inter-pose delay
-- **Per-Motor Movement Locking**: Individual servo locks prevent conflicts during gradual movements
-- **Duplicate Pose Support**: Chain system allows the same pose multiple times in sequence
-
-### Security
-- **Session-Based Authentication**: Secure login system with bcrypt password hashing
-- **Admin-Only Registration**: User creation restricted to admin accounts
-- **Protected API Routes**: All hardware control endpoints require authentication
-- **Default Admin Account**: Automatic creation of admin user on first startup
-
-### User Interface
-- **Modern Web Interface**: Responsive design with Tailwind CSS
-- **Real-time Status Indicators**: Live connection and motor status display
-- **Interactive Sliders**: Onchange-triggered position control for precise movements
-- **Visual Feedback**: Color-coded status, movement locks, and chain queue display
-
-## 🔧 Hardware Requirements
-
-- **Microcontroller**: Raspberry Pi (any model with GPIO and I2C)
-- **Servo Driver**: PCA9685 16-Channel PWM/Servo Driver (I2C address: 0x40)
-- **Servos**: 5 standard servos connected to channels 0-4
-- **GPIO Control**: GPIO 17 for output enable (OE) pin control
-- **Power Supply**: Adequate power for 5 servos (recommend 5-6V, 5A+)
-
-### Wiring Configuration
-- **I2C**: SDA/SCL connected to Raspberry Pi I2C pins
-- **OE Pin**: PCA9685 OE pin connected to GPIO 17
-- **Servos**: 
-  - S2 → Channel 1
-  - S3 → Channel 2
-  - S4 → Channel 3
-  - S5 → Channel 4
-  - S6 → Channel 5
-
-## 📦 Software Dependencies
-
-### ROS2 Environment (Docker)
-- **ROS2 Humble**: Full desktop installation
-- **MoveIt 2.5.9**: Motion planning framework
-- **OMPL**: Open Motion Planning Library
-- **KDL**: Kinematics and Dynamics Library
-- **PyBullet**: Physics simulation for IK
-- **Custom Packages**:
-  - `arm_controller`: Hardware interface and trajectory executor
-  - `arm_moveit_config`: MoveIt configuration
-
-### Python Packages
-```bash
-Flask==3.x
-Flask-CORS
-gpiozero==2.0.1
-adafruit-circuitpython-pca9685
-werkzeug
-sqlite3 (standard library)
+Pi Camera Module 2 -> Pi MJPEG :8080 -> camera_node -> /camera/image_raw
 ```
 
-### System Requirements
-- Python 3.11+
-- I2C enabled on Raspberry Pi
-- SQLite3
+The canonical degree order is:
 
-## 🚀 Quick Start
-
-### Option 1: MoveIt with ROS2 (Recommended)
-
-**See [MOVEIT_QUICK_START.md](MOVEIT_QUICK_START.md) for complete instructions.**
-
-```bash
-# Terminal 1: Hardware
-./ros2-access.sh exec
-ros2 run arm_controller servo_node
-
-# Terminal 2: Joint States
-./ros2-access.sh exec
-ros2 run arm_controller joint_state_publisher_node
-
-# Terminal 3: Trajectory Executor
-./ros2-access.sh exec
-ros2 run arm_controller trajectory_executor
-
-# Terminal 4: MoveIt
-./ros2-access.sh exec
-ros2 launch arm_moveit_config moveit.launch.py
+```text
+[base, shoulder, elbow, wrist, wrist_rotate, gripper]
 ```
 
-### Option 2: GUI with Inverse Kinematics
+The base accepts `0..245` degrees. The other joints accept `0..180` degrees.
+ROS and URDF code call the sixth joint `gripper_base`; the wire-level position
+in the six-value array does not change.
 
-```bash
-./ros2-access.sh exec
-ros2 run arm_controller arm_gui
-# Opens GUI at http://localhost:8050
+## Windows setup
+
+Requirements:
+
+- Docker Desktop in Linux-container mode
+- PowerShell
+- VcXsrv for RViz and the Tk GUI
+
+Install the display server once:
+
+```powershell
+winget install --id marha.VcXsrv --exact
 ```
 
-### Option 3: Direct Control (Legacy)
+Keep Windows Firewall enabled. The helper starts VcXsrv for Docker display
+access; the firewall remains the network boundary.
 
-## 🚀 Installation
+From this directory:
 
-### 1. Clone Repository
-```bash
-git clone <repository-url>
-cd robot_arm_ws
+```powershell
+.\windows.ps1 Setup
+.\windows.ps1 Start
 ```
 
-### 2. Install Dependencies
-```bash
-pip install Flask Flask-CORS gpiozero adafruit-circuitpython-pca9685
+`Setup` creates the ignored `.env.windows` file and a random shared secret.
+`Start` reuses the existing image, starts an idle development container, and
+runs `colcon build --symlink-install`. Compose builds the image only when it is
+missing. It does not contact the Raspberry Pi or start any ROS nodes. Use
+`Rebuild` explicitly after changing Dockerfile dependencies.
+
+`RASHKO_GRIPPER_CLOSED_DEGREES` defaults to `0`, which locks the gripper at its
+logical wide-open command in both the GUI and hardware UDP bridge. Leave it at
+zero until the gripper's open pulse, horn position, and collision-free closed
+endpoint have been physically measured. Then set it to that measured positive
+logical close angle and recreate the Compose container.
+
+## Offline simulation
+
+Open two PowerShell windows after `Start` completes.
+
+Backend and RViz:
+
+```powershell
+.\windows.ps1 Simulation
 ```
 
-### 3. Enable I2C on Raspberry Pi
-```bash
-sudo raspi-config
-# Navigate to: Interface Options → I2C → Enable
-sudo reboot
+GUI:
+
+```powershell
+.\windows.ps1 SimulationGui
 ```
 
-### 4. Verify Hardware Connection
-```bash
-i2cdetect -y 1
-# Should show device at address 0x40
+The backend starts the URDF/STL model, `servo_node`, `robot_state_publisher`,
+MoveIt, and the trajectory executor. The GUI publishes commands but does not
+fake joint feedback; feedback comes from the simulated servos.
+
+To run the dedicated seven-cap sequence in one terminal instead, use:
+
+```powershell
+.\windows.ps1 CapSimulation
 ```
 
-## 🎮 Usage
+This starts its own offline backend, the `cap_sequence_simulation` sequencer
+with `/workspace/config/cap_sequence.simulation.yaml`, and a dedicated RViz
+PlanningScene view. Do not run it alongside `Simulation` or `Hardware`.
+`CapSimulation` starts no camera or UDP bridge and cannot contact the Pi or
+physical servos. The scene now uses the measured 205 mm width, 140 mm battery
+body, 20 mm cap projection, 8.3 mm cap diameter, 30 mm pitch, and the 120 mm
+gap from the battery-facing aluminum plate edge. Unmeasured depth/setback and
+post geometry are visibly documented as simulation assumptions. Exact-URDF
+preflight currently rejects a vertical-down pick at the measured cap height;
+this is an intentional fail-closed result, not permission to try an angled
+hardware grasp. The 120 mm plate gap is roughly 191 mm from the actual base
+rotation axis before cap-row setback, so the current arrangement needs a
+mechanical height/distance redesign before autonomous pickup.
 
-### Starting the Server
-```bash
-cd src/arm_controller/arm_controller
-python3 app.py
+The GUI Cartesian drag control uses the original five-point geometric model in
+`ik_solver.py`. The canvas, orange target, point IK, and GUI forward kinematics
+all use that one model; fixed URDF/TF frame origins are never drawn as extra
+motor joints. Live joint feedback initializes the sliders and target through the
+same geometric FK. MoveIt and RViz keep using the URDF independently for motion
+planning and robot visualization.
+
+There is also a headless end-to-end test:
+
+```powershell
+.\windows.ps1 Smoke
 ```
 
-The server will:
-- Initialize SQLite database (robot_poses.db)
-- Create admin account (username: `username`, password: `user_password`)
-- Initialize PCA9685 servo driver
-- Start Flask server on `http://0.0.0.0:5000`
+It checks rate-limited movement, emergency-stop latching, reset behavior, TF,
+MoveIt's `/compute_ik` service, and a complete `FollowJointTrajectory` action.
+The smoke test is disabled by default and is only started by the command above.
 
-### First Time Setup
-1. Navigate to `http://<raspberry-pi-ip>:5000`
-2. Log in with admin credentials (username / user_password)
-3. Enable motors using the "ENABLE MOTORS" button
-4. Control servos using position sliders
-5. Create additional users via admin panel (accessible to admin only)
+With the simulation backend running, validate the standalone URDF/MoveIt
+Cartesian orientation path for up, horizontal, and down poses:
 
-### Saving Custom Poses
-1. Move servos to desired position
-2. Click "Save Current Position"
-3. Enter a name for the pose
-4. Pose is saved to database
-
-### Using Pose Chaining
-1. Click saved poses to add them to chain queue (max 5)
-2. Poses can be added multiple times (duplicates allowed)
-3. Click "Execute Chain" to run sequence
-4. Use "Stop Chain" for emergency stop during execution
-
-### Graceful Shutdown
-Press `Ctrl+C` to trigger cleanup:
-- Current position saved to `last_position.json`
-- All servo channels set to 0 duty cycle
-- Motors disabled via OE pin
-
-## 📁 Project Structure
-
-```
-robot_arm_ws/
-├── src/
-│   ├── requirements.txt
-│   └── arm_controller/
-│       ├── package.xml
-│       ├── setup.py
-│       ├── setup.cfg
-│       └── arm_controller/
-│           ├── __init__.py
-│           ├── app.py                 # Flask server & hardware control
-│           ├── servo_node.py          # (Legacy ROS2 node)
-│           ├── stop_servos.py         # Emergency stop utility
-│           ├── test.py                # Hardware test script
-│           ├── robot_poses.db         # SQLite database (auto-created)
-│           ├── last_position.json     # Position persistence (auto-created)
-│           ├── templates/
-│           │   ├── index.html         # Main control interface
-│           │   ├── login.html         # Authentication page
-│           │   └── register.html      # Admin user creation page
-│           └── static/
-│               └── js/
-│                   └── app.js         # Frontend control logic
+```powershell
+.\windows.ps1 CartesianTest
 ```
 
-## 🔐 Security Features
+The test is bounded to 30 seconds and fails if simulated joint feedback, exact
+URDF forward kinematics, and the published `tool_tip` transform disagree. It is
+not the solver used by the GUI's mouse-drag target.
 
-### Authentication System
-- **Password Hashing**: Werkzeug bcrypt implementation (SHA-256)
-- **Session Management**: Flask session with secure secret key
-- **Admin Privileges**: Role-based access control with `is_admin` flag
-- **Protected Routes**: All `/api/*` endpoints require `@login_required` decorator
+This is a kinematic/control simulation, not a force or torque simulator. It can
+find software, topic, launch, URDF, and IK faults; it cannot prove the real arm's
+directions, pulse widths, power integrity, backlash, or collision behavior.
 
-### Default Credentials
-- **Username**: username
-- **Password**: user_password
-- ⚠️ **IMPORTANT**: Change default password after first login in production!
+### Known simulation limitations
 
-### User Creation
-- Only admin users can create new accounts via `/register` route
-- New users created without admin privileges (`is_admin = 0`)
-- Username uniqueness enforced at database level
+- MoveIt 2.5.9 in the ROS 2 Humble image logs a class-loader error and exits
+  with `-11` while the smoke-test launch is shutting down. This happens after
+  the test reports `PASS`; normal IK, OMPL planning, and trajectory execution
+  remain operational. Treat it as an unclean binary teardown, not a passed
+  production shutdown test.
+- MoveIt logs that no OctoMap 3D sensor plugin is configured. That is expected
+  until a depth sensor is added; self-collision and URDF collision geometry are
+  still available, but the simulation cannot perceive external obstacles.
+- The camera is disabled in simulation mode. Hardware camera behavior is not
+  covered by the offline test.
 
-## 🗄️ Database Schema
+## Hardware mode
 
-### Users Table
-```sql
-CREATE TABLE users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    is_admin BOOLEAN DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+Prepare the Raspberry Pi using [`Communicator/README.md`](Communicator/README.md),
+then edit `.env.windows` with the Pi's LAN address and copy the shared secret to
+the Pi configuration. Motor traffic uses authenticated UDP port `5005`. Camera
+traffic uses firewall-restricted HTTP MJPEG port `8080`; vision processing
+remains on the laptop.
+
+Before commissioning hardware, launch the Raspberry-only connection console by
+double-clicking `raspberry-console.cmd`, or run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\raspberry.ps1
 ```
 
-### Poses Table
-```sql
-CREATE TABLE poses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    s2 INTEGER NOT NULL,
-    s3 INTEGER NOT NULL,
-    s4 INTEGER NOT NULL,
-    s5 INTEGER NOT NULL,
-    s6 INTEGER NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+Choose **Test every connection**. It checks the Docker engine and container,
+authenticates an SSH session to both Pi services, checks the camera health
+endpoint, and sends the existing authenticated UDP heartbeat. It never resets
+E-stop, enables outputs, or sends a joint target. Continue commissioning only
+after the console reports `[READY]`.
+
+The same console can open an interactive Pi Linux shell in the current or a new
+PowerShell window. Inside SSH, `Ctrl+C` stops the current command and `exit` or
+`Ctrl+D` returns to Windows. Its log actions follow only the controller and
+camera services used by this project.
+
+Backend:
+
+```powershell
+.\windows.ps1 Hardware
 ```
 
-## ⚙️ Configuration
+GUI in a second terminal:
 
-### Servo Angle Limits
-Edit in `app.py`:
-```python
-SERVO_MIN = 0    # Minimum angle (degrees)
-SERVO_MAX = 180  # Maximum angle (degrees)
+```powershell
+.\windows.ps1 Gui
 ```
 
-### Home Position
-Default angles (0° position):
-```python
-HOME_POSITIONS = {
-    's2': 94,
-    's3': 94,
-    's4': 72,
-    's5': 60,
-    's6': 45
-}
+`windows.ps1 EStop` and `ResetEStop` publish `true`/`false` on
+`/emergency_stop` when `udp_servo_bridge` is running, keeping the bridge's
+authenticated retry/latch state synchronized. If the bridge is not running,
+the commands fall back to a direct authenticated UDP request. Resetting the
+latch never enables outputs by itself; a later valid motion command can.
+
+Do the first physical test unloaded, at low speed, with a current-limited supply
+and a real power cutoff within reach.
+
+In hardware mode, `udp_servo_bridge` is the sole `/joint_states` publisher. It
+converts each authenticated Pi ACK into canonical ROS radians, so TF, MoveIt,
+and the GUI follow the Pi controller's rate-limited applied-command estimate
+instead of jumping immediately to the requested target. These are open-loop
+estimates—the hobby servos still provide no measured shaft position.
+
+## Main ROS interfaces
+
+- `/joint_commands`: `std_msgs/Float32MultiArray`, exactly six logical degrees
+- `/servo_speed`: `std_msgs/Float32`, `1..100` percent
+- `/emergency_stop`: `std_msgs/Bool`
+- `/joint_states`: simulated state offline; Pi applied-command estimate on hardware
+- `/raspberry/status`: authenticated Pi acknowledgements in hardware mode
+- `/camera/image_raw`: Pi Camera Module 2 frames republished on the laptop
+- `/camera/preview/compressed`: newest Pi JPEG for the companion GUI, at the
+  source rate. The camera node's frame-rate setting still applies to raw RGB
+  and camera info. Set the Pi camera service's `RASHKO_CAMERA_FPS` to change the
+  upstream frame rate.
+- `/camera/camera_info`: camera metadata; calibrate before metric vision work
+- `/cap_workcell/status`: leased seven-slot fixture observation; never a motor command
+- `/cap_workcell/pick_preview`: unverified high/vertical/high Cartesian sketch JSON
+- `/cap_workcell/pick_preview_markers`: battery envelope and safety-sketch RViz markers
+- `/cap_sequence_simulation/status`: dedicated offline sequence state
+- `/cap_sequence_simulation/markers`: dedicated offline cap/fixture visualization
+- `/simulation/servo_status`: JSON status from the simulated servo controller
+- `/simulation/test_result`: automated smoke-test result
+
+## Useful commands
+
+```text
+.\windows.ps1 Build          build the Docker image
+.\windows.ps1 Rebuild        rebuild image, recreate container, and build ROS
+.\windows.ps1 Start          start container and build the ROS workspace
+.\windows.ps1 Restart        recreate container without rebuilding the image
+.\windows.ps1 Display        start VcXsrv display :0 if needed
+.\windows.ps1 Simulation     offline backend plus RViz
+.\windows.ps1 SimulationGui  GUI companion for offline simulation
+.\windows.ps1 Gui -NoCamera  manual GUI with the camera pipeline disabled
+.\windows.ps1 Stats          snapshot of Docker, ROS processes, and Windows display memory
+.\windows.ps1 CapSimulation  dedicated offline seven-cap sequence and RViz
+.\windows.ps1 Smoke          headless servo + safety + IK test
+.\windows.ps1 CartesianTest  bounded URDF/MoveIt versus RViz/TF orientation test
+.\windows.ps1 CameraCalibrate camera-only 8x6/20mm intrinsic calibration GUI
+.\windows.ps1 CameraSave      validate/export the saved intrinsic YAML
+.\windows.ps1 CapInspect     perception-only seven-cap inspection and RViz preview
+.\windows.ps1 CapStatus      print one current camera/fixture inspection report
+.\windows.ps1 CapFixture     right-handed exact-size SVG from measured fixture data
+.\windows.ps1 CapTest        focused camera, geometry, and trajectory safety tests
+.\windows.ps1 Hardware       real Pi transport backend
+.\windows.ps1 Gui            GUI companion for hardware mode
+.\windows.ps1 EStop          send an authenticated Pi emergency stop
+.\windows.ps1 ResetEStop     reset the Pi latch without enabling outputs
+.\windows.ps1 Logs           show container logs
+.\windows.ps1 Shell          open a ROS-ready shell
+.\windows.ps1 Stop           stop the container
+.\docker-cleanup.ps1         report aggregate Docker usage without deleting data
+.\docker-cleanup.ps1 -Apply  prune old dangling images and dangling build cache
+.\raspberry-console.cmd Check verify every Windows-to-Pi connection safely
+.\raspberry-console.cmd Shell open an interactive Raspberry Pi Linux shell
 ```
 
-### Movement Speed
-- **Range**: 10ms - 500ms per degree
-- **Default**: 100ms per degree per servo
-- **Adjustable**: Individual speed sliders in web interface
+The camera cap prototype is intentionally preview-only: it has no action client
+and always reports hardware motion unauthorized. Raw color pixel centering does
+not require camera calibration; metric image geometry still does. Real
+autonomous execution remains blocked until measured fixture/battery/gripper geometry,
+dummy-battery trials, and a full MoveIt PlanningScene are commissioned. Its
+Cartesian sketch is not robot collision checking and must never be connected
+directly to a motion topic. A production autonomous stage also needs a single
+leased command arbiter before the UDP bridge and correctly timed/retimed
+trajectory execution; publisher counting and the current sequential checkpoint
+executor do not provide those guarantees.
 
-### PWM Frequency
-```python
-pca.frequency = 50  # 50Hz for standard servos
-```
-
-## 🌐 API Endpoints
-
-All endpoints require authentication via session cookie.
-
-### Hardware Control
-- `POST /api/servo` - Set single servo position
-- `POST /api/servos/batch` - Set multiple servos simultaneously
-- `POST /api/emergency-stop` - Emergency stop all servos
-- `POST /api/oe/toggle` - Enable/disable motors via OE pin
-- `GET /api/status` - Get current servo positions and motor status
-
-### Pose Management
-- `GET /api/poses` - Get all saved poses
-- `POST /api/poses/save` - Save current position as named pose
-- `DELETE /api/poses/<id>` - Delete saved pose
-- `GET /api/last-position` - Get last saved position from file
-
-### Authentication
-- `GET /login` - Login page
-- `POST /login` - Login handler
-- `GET /register` - User creation page (admin only)
-- `POST /register` - User creation handler (admin only)
-- `GET /logout` - Logout and clear session
-
-## 🐛 Troubleshooting
-
-### I2C Device Not Found
-```bash
-sudo i2cdetect -y 1
-# If empty, check wiring and enable I2C in raspi-config
-```
-
-### Permission Denied on GPIO
-```bash
-sudo usermod -a -G gpio $USER
-# Logout and login again
-```
-
-### Database Migration Error
-If you see "table users has no column named is_admin":
-- The auto-migration will run on next startup
-- Manual fix: `ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT 0;`
-
-### Servo Not Moving
-1. Check "ENABLE MOTORS" is active (yellow button)
-2. Verify OE pin connection to GPIO 17
-3. Confirm servo power supply is adequate
-4. Check PCA9685 channel connections
-
-### Authentication Loop
-- Clear browser cookies
-- Check Flask session secret key is set
-- Restart server to regenerate session
-
-## 📝 Development Notes
-
-### Movement System
-- Gradual movement: 1° steps with per-servo delay
-- Per-servo locking prevents simultaneous movements on same motor
-- `onchange` event trigger (movement on slider release, not during drag)
-
-### Frontend State Management
-```javascript
-isMoving = {s2: false, s3: false, s4: false, s5: false, s6: false}
-servoSpeeds = {s2: 100, s3: 100, s4: 100, s5: 100, s6: 100}
-chainQueue = []  // Max 5 poses
-```
-
-### Signal Handlers
-- `SIGINT (Ctrl+C)`: Save position and cleanup
-- `SIGTERM`: Graceful shutdown
-- `atexit`: Cleanup hook for normal exit
-
-## 🔄 Version History
-
-### v1.0.0 (Current)
-- ✅ Per-motor movement locking
-- ✅ Individual servo speed controls
-- ✅ Position persistence with signal handlers
-- ✅ Pose chaining system (max 5, duplicates allowed)
-- ✅ Session-based authentication
-- ✅ Admin-only user registration
-- ✅ Motor state-dependent UI locking
-
-## 📄 License
-
-TODO: Add license information
-
-## 👤 Author
-
-**Kristiyan**
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to branch (`git push origin feature/AmazingFeature`)
-5. Open Pull Request
-
-## ⚠️ Safety Warnings
-
-- Always test in a safe environment before full operation
-- Emergency stop button should always be accessible
-- Monitor servo temperatures during extended use
-- Ensure adequate power supply to prevent brownouts
-- Keep workspace clear of obstructions
-- Never disable motor safety interlocks in production
-
-## 📞 Support
-
-For issues and questions, please open an issue on GitHub.
-
----
-
-
-## Continuous Integration (CI)
-
-This repository includes GitHub Actions workflows to run tests and optionally build Docker images.
-
-- CI workflow: `.github/workflows/ci.yml` — runs on push and pull requests and executes:
-    - Python setup (3.11)
-    - Install dependencies (`src/requirements.txt` if present)
-    - Install package from `src/arm_controller`
-    - Run `flake8` and `pytest`
-
-- Docker build workflow: `.github/workflows/docker-build.yml` — triggers on pushes to `main` when `Dockerfile`, `requirements.txt` or `src/` files change. It will build an image and push to the registry only if both a `Dockerfile` is present and Docker registry secrets are configured.
-
-Required repository secrets for Docker push (optional):
-- `DOCKERHUB_USERNAME` — Docker registry username
-- `DOCKERHUB_TOKEN` — Docker registry token or password
-- `DOCKERHUB_REPO` — Optional repository name (e.g. `yourrepo/roboarm`)
-
-How to run CI locally (quick):
-```bash
-# Run tests locally
-python -m pip install -r src/requirements.txt
-pip install -e src/arm_controller
-pytest -q
-```
-**Made with ❤️ for sigma grindset bob the builder aurafarmers**
+See [instructions.md](instructions.md) for the operator startup, Pi-shell, and
+pre-motor checklist; [WINDOWS_RASPBERRY_SETUP.md](WINDOWS_RASPBERRY_SETUP.md)
+contains commissioning details, and [AGENTS.md](AGENTS.md) is the
+maintainer/LLM handoff contract.

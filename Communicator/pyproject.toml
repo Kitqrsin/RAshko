@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rashko-communicator"
+version = "0.1.0"
+description = "Standalone authenticated Raspberry Pi controller for the RAshko arm"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+hardware = [
+    "adafruit-blinka>=8.0",
+    "adafruit-circuitpython-pca9685>=3.4",
+    "gpiozero>=2.0",
+]
+test = []
+
+[project.scripts]
+rashko-controller = "rashko_communicator.controller:main"
+rashko-send-angles = "rashko_communicator.send_angles:main"
+rashko-camera = "rashko_communicator.camera_stream:main"
+
+[tool.setuptools.packages.find]
+include = ["rashko_communicator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

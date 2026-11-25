@@ -1,6 +1,6 @@
 # 🎮 Robot Arm GUI Controller
 
-Simple Tkinter-based GUI application for controlling the Jarvis robot arm and testing ROS2 integration.
+Simple Tkinter-based GUI application for controlling the RAshko robot arm and testing ROS2 integration.
 
 ## Features
 
@@ -31,7 +31,7 @@ The GUI is already integrated into your ROS2 package!
 
 ### Build the package:
 ```bash
-cd /home/tnt/arm_project/Robotic-Arm---Jarvis
+cd /home/tnt/arm_project/RAshko
 ./ros2-access.sh exec
 cd /workspace
 colcon build --packages-select arm_controller

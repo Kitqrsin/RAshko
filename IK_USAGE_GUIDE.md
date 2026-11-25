@@ -40,7 +40,7 @@ ros2 topic pub --once /move_to_position geometry_msgs/msg/Point "{x: 0.25, y: 0.
 ```bash
 # Start Docker
 sudo docker run -it --rm --privileged --network host \
-  -v /home/tnt/arm_project/Robotic-Arm---Jarvis:/workspace \
+  -v /home/tnt/arm_project/RAshko:/workspace \
   -v /dev:/dev -e DISPLAY=$DISPLAY \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   ros2-arm:latest

@@ -9,11 +9,13 @@ from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 import sys
 
+from arm_controller.joint_contract import HOME_DEGREES, SERVO_MAX_DEGREES
+
 class SimpleArmController(Node):
     def __init__(self):
         super().__init__('simple_arm_controller')
         self.publisher = self.create_publisher(Float32MultiArray, '/joint_commands', 10)
-        self.positions = [90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+        self.positions = list(HOME_DEGREES)
         self.joint_names = ['Base', 'Shoulder', 'Elbow', 'Wrist', 'Wrist_Rotate', 'Gripper']
         
     def send_command(self):
@@ -32,7 +34,7 @@ def main():
     print("\nCommands:")
     print("  1-6: Select joint (Base, Shoulder, Elbow, Wrist, WristRot, Gripper)")
     print("  +/-: Increase/decrease selected joint by 5°")
-    print("  h: Go to home (all 90°)")
+    print(f"  h: Go to calibrated home {list(HOME_DEGREES)}")
     print("  s: Show current positions")
     print("  q: Quit")
     print("="*60 + "\n")
@@ -50,7 +52,7 @@ def main():
             print("Exiting...")
             break
         elif command == 'h':
-            controller.positions = [90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+            controller.positions = list(HOME_DEGREES)
             controller.send_command()
             print("Moved to HOME position")
         elif command == 's':
@@ -61,7 +63,10 @@ def main():
             selected_joint = int(command) - 1
             print(f"Selected: {controller.joint_names[selected_joint]}")
         elif command == '+':
-            controller.positions[selected_joint] = min(180.0, controller.positions[selected_joint] + 5.0)
+            controller.positions[selected_joint] = min(
+                SERVO_MAX_DEGREES[selected_joint],
+                controller.positions[selected_joint] + 5.0,
+            )
             controller.send_command()
         elif command == '-':
             controller.positions[selected_joint] = max(0.0, controller.positions[selected_joint] - 5.0)

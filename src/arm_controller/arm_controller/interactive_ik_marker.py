@@ -20,6 +20,7 @@ from std_msgs.msg import Float32MultiArray
 
 # Import IK solver
 from arm_controller.ik_solver import ArmIKSolver
+from arm_controller.joint_contract import HOME_DEGREES, servo_degrees_to_radians
 
 
 class InteractiveIKMarker(Node):
@@ -42,7 +43,7 @@ class InteractiveIKMarker(Node):
         # Gripper orientation (pitch and roll in radians)
         self.target_pitch = 0.0  # Horizontal gripper
         self.target_roll = 0.0
-        self.gripper_angle = 90.0  # Default gripper opening
+        self.gripper_angle = HOME_DEGREES[5]
         
         # Joint names matching URDF
         self.joint_names = [
@@ -205,7 +206,7 @@ class InteractiveIKMarker(Node):
         }
         
         # Build joint positions array
-        positions = [90.0] * 6
+        positions = list(HOME_DEGREES)
         for ik_joint, idx in ik_to_idx.items():
             if ik_joint in joint_angles:
                 positions[idx] = float(joint_angles[ik_joint])
@@ -221,13 +222,7 @@ class InteractiveIKMarker(Node):
         joint_state_msg.header.stamp = self.get_clock().now().to_msg()
         joint_state_msg.name = self.joint_names
         
-        # Build joint positions with proper conversion for RViz
-        rviz_positions = []
-        for i, pos in enumerate(positions):
-            if i == 2:  # Elbow joint - invert for RViz
-                rviz_positions.append(float(math.radians(90.0 - pos)))
-            else:
-                rviz_positions.append(float(math.radians(pos - 90.0)))
+        rviz_positions = list(servo_degrees_to_radians(positions))
         
         joint_state_msg.position = rviz_positions
         self.joint_state_pub.publish(joint_state_msg)

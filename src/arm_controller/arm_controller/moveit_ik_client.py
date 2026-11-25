@@ -5,6 +5,7 @@ Uses MoveIt's compute_ik service for accurate inverse kinematics
 """
 
 import math
+import time
 from typing import Optional, Dict, Tuple
 
 import rclpy
@@ -17,6 +18,15 @@ from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
 from tf2_ros import TransformException
 
+from arm_controller.joint_contract import (
+    HOME_DEGREES,
+    JOINT_NAMES as CONTRACT_JOINT_NAMES,
+    SERVO_MAX_DEGREES,
+    radians_to_servo_degrees,
+    servo_degrees_to_radians,
+)
+from arm_controller.tool_pose import ARM_LINKS, TOOL_LINK, tool_elevation, tool_quaternion
+
 
 class MoveItIKClient:
     """
@@ -25,13 +35,13 @@ class MoveItIKClient:
     """
     
     # Joint names in the arm group (from SRDF)
-    JOINT_NAMES = ['base', 'shoulder', 'elbow', 'wrist', 'wrist_rotate']
+    JOINT_NAMES = list(CONTRACT_JOINT_NAMES[:5])
     
     # Planning group name (from SRDF)
     PLANNING_GROUP = 'arm'
     
     # End effector link (tip of the kinematic chain)
-    END_EFFECTOR_LINK = 'gripper_base'
+    END_EFFECTOR_LINK = TOOL_LINK
     
     def __init__(self, node: Node):
         """
@@ -57,14 +67,14 @@ class MoveItIKClient:
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, node)
         
-        # Home position (GUI degrees, 90° = home)
+        # Calibrated logical-servo home (maps to URDF zero radians).
         self.home_position = {
-            'base': 90.0,
-            'shoulder': 90.0,
-            'elbow': 90.0,
-            'wrist': 90.0,
-            'wrist_rotate': 90.0,
-            'gripper': 90.0
+            'base': HOME_DEGREES[0],
+            'shoulder': HOME_DEGREES[1],
+            'elbow': HOME_DEGREES[2],
+            'wrist': HOME_DEGREES[3],
+            'wrist_rotate': HOME_DEGREES[4],
+            'gripper': HOME_DEGREES[5],
         }
         
         # Track if MoveIt is available
@@ -81,6 +91,7 @@ class MoveItIKClient:
     
     def is_available(self) -> bool:
         """Check if MoveIt IK service is available."""
+        self._moveit_available = self.ik_client.service_is_ready()
         return self._moveit_available
     
     def wait_for_service(self, timeout_sec: float = 5.0) -> bool:
@@ -103,16 +114,17 @@ class MoveItIKClient:
         
         Args:
             x, y, z: Target position in meters (world frame)
-            pitch: Desired pitch angle of end effector (radians)
-            roll: Desired roll angle of end effector (radians)
+            pitch: Physical tool elevation in radians (+pi/2 up, 0 horizontal,
+                -pi/2 down)
+            roll: Rotation about the physical tool direction in radians
             gripper_angle: Gripper opening angle (degrees), None to keep current
             seed_state: Optional seed joint state for IK solver (degrees)
             
         Returns:
-            Dict of joint angles in degrees (GUI convention: 90° = home),
+            Dict of joint angles in logical servo degrees,
             or None if IK fails
         """
-        if not self._moveit_available:
+        if not self.is_available():
             self.logger.error("MoveIt IK service not available!")
             return None
         
@@ -131,22 +143,11 @@ class MoveItIKClient:
         target_pose.pose.position.y = y
         target_pose.pose.position.z = z
         
-        # Calculate orientation for gripper to point towards the target
-        # The gripper should point outward from the base towards the XY position
-        # Yaw: rotation around Z to point towards target in XY plane
-        # Pitch: angle to reach the height (pointing down if z < arm height, up if z > arm height)
-        yaw = math.atan2(y, x)  # Point towards target in XY plane
-        
-        # For a reaching pose, we typically want gripper pointing outward and slightly down
-        # The pitch should be relative to horizontal, not the input pitch
-        # A pitch of 0 means horizontal gripper, negative means pointing down
-        gripper_pitch = pitch  # Use the provided pitch (0 = horizontal)
-        
-        # Roll is rotation around the gripper's pointing direction
-        gripper_roll = roll
-        
-        quat = self._euler_to_quaternion(gripper_roll, gripper_pitch, yaw)
-        target_pose.pose.orientation = quat
+        azimuth = math.atan2(y, x)
+        quat = tool_quaternion(azimuth, pitch, roll)
+        target_pose.pose.orientation = Quaternion(
+            x=quat[0], y=quat[1], z=quat[2], w=quat[3]
+        )
         
         request.ik_request.pose_stamped = target_pose
         
@@ -158,21 +159,16 @@ class MoveItIKClient:
         robot_state.joint_state.header.stamp = self.node.get_clock().now().to_msg()
         robot_state.joint_state.name = self.JOINT_NAMES
         
-        # Convert from GUI degrees (90° = home) to radians (0 = home)
+        # Convert from calibrated logical servo degrees to URDF radians.
         # Use provided seed_state or default to home position
-        positions = []
-        for name in self.JOINT_NAMES:
-            if seed_state and name in seed_state:
-                gui_deg = seed_state[name]
-            else:
-                gui_deg = self.home_position.get(name, 90.0)
-            
-            # Handle shoulder and elbow inversion for MoveIt (matches URDF joint axes)
-            if name == 'shoulder' or name == 'elbow':
-                rad_val = math.radians(90.0 - gui_deg)
-            else:
-                rad_val = math.radians(gui_deg - 90.0)
-            positions.append(rad_val)
+        seed_degrees = [
+            (seed_state or {}).get(name, self.home_position[name])
+            for name in self.JOINT_NAMES
+        ]
+        seed_degrees.append(
+            gripper_angle if gripper_angle is not None else HOME_DEGREES[5]
+        )
+        positions = list(servo_degrees_to_radians(seed_degrees)[:5])
         
         robot_state.joint_state.position = positions
         request.ik_request.robot_state = robot_state
@@ -185,8 +181,15 @@ class MoveItIKClient:
             # Call the service synchronously
             future = self.ik_client.call_async(request)
             
-            # Wait for result (with timeout)
-            rclpy.spin_until_future_complete(self.node, future, timeout_sec=1.0)
+            # The GUI already spins this node on its ROS thread. Spinning the
+            # same node here from Tk's thread can corrupt the executor state.
+            deadline = time.monotonic() + 1.0
+            while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            if not future.done():
+                self.logger.error("IK service call timed out after 1.0 second")
+                return None
             
             if future.result() is None:
                 self.logger.error("IK service call failed (no result)")
@@ -206,17 +209,13 @@ class MoveItIKClient:
             result = {}
             for i, name in enumerate(joint_state.name):
                 if name in self.JOINT_NAMES:
-                    # Convert from radians (0 = home) to GUI degrees (90° = home)
                     rad_value = joint_state.position[i]
-                    
-                    # Handle shoulder and elbow inversion (matches URDF joint axes)
-                    if name == 'shoulder' or name == 'elbow':
-                        deg_value = 90.0 - math.degrees(rad_value)
-                    else:
-                        deg_value = math.degrees(rad_value) + 90.0
-                    
-                    # Clamp to 0-180
-                    deg_value = max(0.0, min(180.0, deg_value))
+                    joint_index = CONTRACT_JOINT_NAMES.index(name)
+                    deg_value = radians_to_servo_degrees(joint_index, rad_value)
+                    deg_value = max(
+                        0.0,
+                        min(SERVO_MAX_DEGREES[joint_index], deg_value),
+                    )
                     
                     # Map URDF joint names to GUI joint names
                     # URDF 'wrist' -> GUI 'forearm' (index 3)
@@ -229,7 +228,9 @@ class MoveItIKClient:
                         result[name] = deg_value
             
             # Add gripper (not controlled by MoveIt)
-            result['gripper'] = gripper_angle if gripper_angle is not None else 90.0
+            result['gripper'] = (
+                gripper_angle if gripper_angle is not None else HOME_DEGREES[5]
+            )
             
             self.logger.info(f"IK solution found: {result}")
             return result
@@ -250,7 +251,7 @@ class MoveItIKClient:
         Calculate end effector position from joint angles using TF.
         
         Args:
-            Joint angles in degrees (GUI convention: 90° = home)
+            Joint angles in calibrated logical servo degrees
             
         Returns:
             Tuple of (x, y, z, pitch, roll) position and orientation
@@ -267,9 +268,10 @@ class MoveItIKClient:
             y = trans.transform.translation.y
             z = trans.transform.translation.z
             
-            # Extract orientation as pitch/roll
+            # Report the physical gripper elevation, not the CAD link's Euler pitch.
             quat = trans.transform.rotation
-            pitch, roll = self._quaternion_to_pitch_roll(quat)
+            pitch = tool_elevation((quat.x, quat.y, quat.z, quat.w))
+            roll = 0.0
             
             return (x, y, z, pitch, roll)
             
@@ -277,6 +279,23 @@ class MoveItIKClient:
             self.logger.debug(f"TF lookup failed: {e}, using fallback FK")
             # Fallback to simple geometric FK
             return self._fallback_forward_kinematics(base, shoulder, elbow, forearm, wrist)
+
+    def link_positions(self) -> Optional[list[tuple[float, float, float]]]:
+        """Return exact URDF link origins in ``base_link`` coordinates."""
+        positions = []
+        try:
+            for link_name in ARM_LINKS:
+                if link_name == "base_link":
+                    positions.append((0.0, 0.0, 0.0))
+                    continue
+                transform = self.tf_buffer.lookup_transform(
+                    "base_link", link_name, rclpy.time.Time()
+                )
+                translation = transform.transform.translation
+                positions.append((translation.x, translation.y, translation.z))
+        except TransformException:
+            return None
+        return positions
     
     def _fallback_forward_kinematics(
         self,
@@ -296,11 +315,12 @@ class MoveItIKClient:
         L_lower = 0.084   # Elbow to wrist
         L_wrist = 0.086   # Wrist to gripper
         
-        # Convert to radians matching RViz/URDF convention
-        base_rad = math.radians(base - 90.0)
-        shoulder_rad = math.radians(90.0 - shoulder)  # Inverted
-        elbow_rad = math.radians(90.0 - elbow)  # Inverted
-        forearm_rad = math.radians(90.0 - forearm)  # INVERTED (matches IK encode)
+        # Convert through the canonical calibrated mapping.
+        base_rad, shoulder_rad, elbow_rad, forearm_rad, wrist_rad = (
+            servo_degrees_to_radians(
+                (base, shoulder, elbow, forearm, wrist, HOME_DEGREES[5])
+            )[:5]
+        )
         
         # Calculate positions using vertical-based system (matching Tkinter)
         elbow_x = L_upper * math.sin(shoulder_rad)
@@ -317,8 +337,6 @@ class MoveItIKClient:
         x = end_x * math.cos(base_rad)
         y = end_x * math.sin(base_rad)
         z = end_z
-        
-        wrist_rad = math.radians(wrist - 90.0)
         
         return (x, y, z, pitch, wrist_rad)
     

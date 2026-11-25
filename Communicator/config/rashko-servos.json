@@ -1,0 +1,76 @@
+{
+  "frequency_hz": 50.0,
+  "i2c_address": 64,
+  "oe_gpio": 17,
+  "max_speed_deg_per_second": 180.0,
+  "home_degrees": [
+    90.0,
+    88.0,
+    90.0,
+    96.0,
+    98.0,
+    0.0
+  ],
+  "servos": [
+    {
+      "name": "base",
+      "channel": 0,
+      "inverted": false,
+      "logical_min_deg": 0.0,
+      "logical_max_deg": 245.0,
+      "actuation_range_deg": 270.0,
+      "min_pulse_us": 1000,
+      "max_pulse_us": 2000
+    },
+    {
+      "name": "shoulder",
+      "channel": 1,
+      "inverted": true,
+      "logical_min_deg": 0.0,
+      "logical_max_deg": 180.0,
+      "actuation_range_deg": 180.0,
+      "min_pulse_us": 833,
+      "max_pulse_us": 2167
+    },
+    {
+      "name": "elbow",
+      "channel": 2,
+      "inverted": true,
+      "logical_min_deg": 0.0,
+      "logical_max_deg": 180.0,
+      "actuation_range_deg": 180.0,
+      "min_pulse_us": 500,
+      "max_pulse_us": 2500
+    },
+    {
+      "name": "wrist",
+      "channel": 4,
+      "inverted": false,
+      "logical_min_deg": 0.0,
+      "logical_max_deg": 180.0,
+      "actuation_range_deg": 180.0,
+      "min_pulse_us": 500,
+      "max_pulse_us": 2500
+    },
+    {
+      "name": "wrist_rotate",
+      "channel": 5,
+      "inverted": false,
+      "logical_min_deg": 0.0,
+      "logical_max_deg": 180.0,
+      "actuation_range_deg": 180.0,
+      "min_pulse_us": 1000,
+      "max_pulse_us": 2000
+    },
+    {
+      "name": "gripper",
+      "channel": 6,
+      "inverted": false,
+      "logical_min_deg": 0.0,
+      "logical_max_deg": 180.0,
+      "actuation_range_deg": 180.0,
+      "min_pulse_us": 1000,
+      "max_pulse_us": 2000
+    }
+  ]
+}

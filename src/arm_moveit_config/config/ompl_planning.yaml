@@ -28,13 +28,5 @@ gripper:
   planner_configs:
     - RRTConnectkConfigDefault
   default_planner_config: RRTConnectkConfigDefault
-  projection_evaluator: joints(gripper)
+  projection_evaluator: joints(gripper_base)
   longest_valid_segment_fraction: 0.05
-
-arm_with_gripper:
-  planner_configs:
-    - RRTConnectkConfigDefault
-    - RRTstarkConfigDefault
-  default_planner_config: RRTConnectkConfigDefault
-  projection_evaluator: joints(base,shoulder,elbow,wrist)
-  longest_valid_segment_fraction: 0.005

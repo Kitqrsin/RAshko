@@ -102,12 +102,23 @@ class GUIObjectDetector:
         self._det_lock = threading.Lock()
         self._detection_running = False
 
-        # --- Face: YuNet DNN ---
+        self._cascade = cascade
         self._yunet = None
         self.face_cascade = None
         self._face_backend = None       # 'yunet' or 'haar'
+        self._face_load_attempted = False
+        self._yolo_load_attempted = False
+        self._yolo_net = None
+        self._yolo_input_size = 640
+        self._yolo_conf = 0.45
+        self._yolo_nms = 0.45
 
-        if CV2_AVAILABLE and hasattr(cv2, 'FaceDetectorYN'):
+    def _load_face_backend(self):
+        if self._face_load_attempted or not CV2_AVAILABLE:
+            return
+        self._face_load_attempted = True
+
+        if hasattr(cv2, 'FaceDetectorYN'):
             model_path = self._find_model(_YUNET_MODEL_CANDIDATES)
             if model_path:
                 try:
@@ -122,13 +133,13 @@ class GUIObjectDetector:
                 except Exception as e:
                     self._log('warn', f'YuNet init failed ({e}), falling back to Haar')
 
-        if self._yunet is None and CV2_AVAILABLE:
-            if os.path.isfile(cascade):
-                cascade_path = cascade
+        if self._yunet is None:
+            if os.path.isfile(self._cascade):
+                cascade_path = self._cascade
             else:
                 cv2_data = getattr(cv2, 'data', None)
                 data_dir = cv2_data.haarcascades if cv2_data else ''
-                cascade_path = os.path.join(data_dir, cascade)
+                cascade_path = os.path.join(data_dir, self._cascade)
             self.face_cascade = cv2.CascadeClassifier(cascade_path)
             if self.face_cascade.empty():
                 self._log('error', f'Failed to load cascade from {cascade_path}')
@@ -137,25 +148,20 @@ class GUIObjectDetector:
                 self._face_backend = 'haar'
                 self._log('info', f'Face detector: Haar cascade ({cascade_path})')
 
-        # --- Cup: YOLOv8n ONNX via cv2.dnn ---
-        self._yolo_net = None
-        self._yolo_input_size = 640
-        self._yolo_conf = 0.45
-        self._yolo_nms = 0.45
-
-        if CV2_AVAILABLE:
-            yolo_path = self._find_model(_YOLO_MODEL_CANDIDATES)
-            if yolo_path:
-                try:
-                    self._yolo_net = cv2.dnn.readNetFromONNX(yolo_path)
-                    self._yolo_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                    self._yolo_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-                    self._log('info', f'Cup detector: YOLOv8n ONNX ({yolo_path})')
-                except Exception as e:
-                    self._log('warn', f'YOLOv8n ONNX load failed: {e}')
-
-        # Combined backend flag
-        self._backend = self._face_backend  # initially face mode
+    def _load_cup_backend(self):
+        if self._yolo_load_attempted or not CV2_AVAILABLE:
+            return
+        self._yolo_load_attempted = True
+        yolo_path = self._find_model(_YOLO_MODEL_CANDIDATES)
+        if yolo_path:
+            try:
+                net = cv2.dnn.readNetFromONNX(yolo_path)
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                self._yolo_net = net
+                self._log('info', f'Cup detector: YOLOv8n ONNX ({yolo_path})')
+            except Exception as e:
+                self._log('warn', f'YOLOv8n ONNX load failed: {e}')
 
     @staticmethod
     def _find_model(candidates):
@@ -187,7 +193,9 @@ class GUIObjectDetector:
 
     @property
     def cup_detection_available(self) -> bool:
-        return self._yolo_net is not None
+        if self._yolo_load_attempted:
+            return self._yolo_net is not None
+        return CV2_AVAILABLE and self._find_model(_YOLO_MODEL_CANDIDATES) is not None
 
     @property
     def detections(self) -> list[dict]:
@@ -197,15 +205,12 @@ class GUIObjectDetector:
 
     def process_frame(self, frame_rgb: np.ndarray) -> np.ndarray:
         """Run detection (if due) and draw overlays on *frame_rgb*."""
-        if not self.enabled:
+        if not self.enabled or not CV2_AVAILABLE:
             return frame_rgb
 
-        # Check that the active mode has a backend
-        if self._mode == 'face' and self._face_backend is None:
+        if self._mode == 'face' and self._face_load_attempted and self._face_backend is None:
             return frame_rgb
-        if self._mode == 'cup' and self._yolo_net is None:
-            return frame_rgb
-        if self._mode == 'red' and not CV2_AVAILABLE:
+        if self._mode == 'cup' and self._yolo_load_attempted and self._yolo_net is None:
             return frame_rgb
 
         self._frame_counter += 1
@@ -216,7 +221,7 @@ class GUIObjectDetector:
                 det_frame = frame_rgb.copy()
                 self._detection_running = True
                 threading.Thread(
-                    target=self._bg_detect, args=(det_frame,), daemon=True
+                    target=self._bg_detect, args=(det_frame, self._mode), daemon=True
                 ).start()
 
         return self._draw_overlay(frame_rgb)
@@ -224,23 +229,28 @@ class GUIObjectDetector:
     # ------------------------------------------------------------------ #
     #  Internal — detection                                                #
     # ------------------------------------------------------------------ #
-    def _bg_detect(self, frame_rgb: np.ndarray):
+    def _bg_detect(self, frame_rgb: np.ndarray, mode: str):
         try:
-            self._run_detection(frame_rgb)
+            self._run_detection(frame_rgb, mode)
         finally:
             self._detection_running = False
 
-    def _run_detection(self, frame_rgb: np.ndarray):
+    def _run_detection(self, frame_rgb: np.ndarray, mode: str):
         """Run detection and store results based on current mode."""
         try:
-            if self._mode == 'red':
+            if mode == 'red':
                 self._run_red_hsv(frame_rgb)
-            elif self._mode == 'cup' and self._yolo_net is not None:
-                self._run_yolo(frame_rgb)
-            elif self._yunet is not None:
-                self._run_yunet(frame_rgb)
-            elif self.face_cascade is not None:
-                self._run_haar(frame_rgb)
+            elif mode == 'cup':
+                self._load_cup_backend()
+                if self.enabled and self._mode == mode and self._yolo_net is not None:
+                    self._run_yolo(frame_rgb)
+            else:
+                self._load_face_backend()
+                if self.enabled and self._mode == mode:
+                    if self._yunet is not None:
+                        self._run_yunet(frame_rgb)
+                    elif self.face_cascade is not None:
+                        self._run_haar(frame_rgb)
         except Exception as e:
             self._log('error', f'Detection error: {e}')
 
@@ -382,8 +392,7 @@ class GUIObjectDetector:
 
         if PIL_AVAILABLE:
             return self._draw_with_pil(frame_rgb, dets)
-        else:
-            return self._draw_with_numpy(frame_rgb, dets)
+        return self._draw_with_numpy(frame_rgb.copy(), dets)
 
     def _run_red_hsv(self, frame_rgb: np.ndarray):
         """Detect red objects via HSV colour filtering."""

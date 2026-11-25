@@ -28,6 +28,8 @@ install(DIRECTORY config
 # Install launch files
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "*.pyc" EXCLUDE
 )
 
 ament_package()

@@ -71,13 +71,13 @@ yourdfpy robot_arm.urdf --animate
 
 ### Option A: Just See the Structure
 ```bash
-cd /home/tnt/arm_project/Robotic-Arm---Jarvis
+cd /home/tnt/arm_project/RAshko
 python3 visualize_urdf.py
 ```
 
 ### Option B: Interactive 3D Visualization (Best)
 ```bash
-cd /home/tnt/arm_project/Robotic-Arm---Jarvis
+cd /home/tnt/arm_project/RAshko
 ./ros2-access.sh start "ros2 launch /workspace/view_urdf.launch.py"
 ```
 
@@ -183,4 +183,4 @@ Once RViz is running:
 ---
 
 **Created:** 2026-01-22
-**For:** Jarvis Robotic Arm Project
+**For:** RAshko Robotic Arm Project

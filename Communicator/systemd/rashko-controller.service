@@ -1,0 +1,36 @@
+[Unit]
+Description=RAshko authenticated robot-arm controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rashko
+Group=rashko
+SupplementaryGroups=i2c gpio
+RuntimeDirectory=rashko-controller
+RuntimeDirectoryMode=0750
+WorkingDirectory=/run/rashko-controller
+EnvironmentFile=/etc/rashko-controller.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=GPIOZERO_PIN_FACTORY=lgpio
+ExecStart=/opt/rashko-communicator/.venv/bin/rashko-controller
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+KillSignal=SIGTERM
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

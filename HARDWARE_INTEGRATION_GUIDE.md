@@ -59,7 +59,7 @@ Before connecting to ROS2, verify servos work:
 
 ```bash
 # Run calibration (sets all to 90°)
-cd /home/tnt/arm_project/Robotic-Arm---Jarvis/src/arm_controller/arm_controller
+cd /home/tnt/arm_project/RAshko/src/arm_controller/arm_controller
 python3 motor_calibration.py
 ```
 
@@ -74,7 +74,7 @@ You already have a hardware interface node! Run it **on the Raspberry Pi**:
 
 ```bash
 # On Raspberry Pi (not in Docker)
-cd /home/tnt/arm_project/Robotic-Arm---Jarvis
+cd /home/tnt/arm_project/RAshko
 source install/setup.bash
 
 # Run the servo hardware node
@@ -91,7 +91,7 @@ This node:
 **Option A: Run GUI on Pi (Direct Connection)**
 ```bash
 # On Raspberry Pi
-ros2 launch /home/tnt/arm_project/Robotic-Arm---Jarvis/view_with_gui.launch.py
+ros2 launch /home/tnt/arm_project/RAshko/view_with_gui.launch.py
 ```
 
 **Option B: Run GUI on PC, Hardware on Pi (Network)**

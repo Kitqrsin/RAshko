@@ -61,7 +61,7 @@ servo_disc_3 (gripper fingers)
 
 **Verification:**
 ```bash
-cd /home/tnt/arm_project/Robotic-Arm---Jarvis/robot_urdf
+cd /home/tnt/arm_project/RAshko/robot_urdf
 grep -E '<link name=|<parent link=|<child link=' robot_fixed.urdf
 ```
 
@@ -329,7 +329,7 @@ Create ROS2 control configuration to bridge MoveIt and hardware.
 docker exec ros2_robot_arm bash -c "source /opt/ros/humble/setup.bash && ros2 pkg list | grep moveit"
 
 # Verify URDF links
-grep '<link name=' /home/tnt/arm_project/Robotic-Arm---Jarvis/robot_urdf/robot_fixed.urdf
+grep '<link name=' /home/tnt/arm_project/RAshko/robot_urdf/robot_fixed.urdf
 
 # Test URDF validity
 docker exec ros2_robot_arm bash -c "source /opt/ros/humble/setup.bash && check_urdf /workspace/robot_urdf/robot_fixed.urdf"

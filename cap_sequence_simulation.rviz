@@ -1,0 +1,106 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.55
+      Cell Size: 0.05
+      Class: rviz_default_plugins/Grid
+      Color: 120; 120; 125
+      Enabled: true
+      Name: Ground Grid
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
+      Description Source: Topic
+      Description Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Enabled: true
+      Name: Simulated Arm
+      Visual Enabled: true
+    - Class: moveit_rviz_plugin/MotionPlanning
+      Enabled: true
+      Move Group Namespace: ""
+      Name: MoveIt PlanningScene
+      Planning Scene Topic: /monitored_planning_scene
+      Robot Description: robot_description
+      Scene Geometry:
+        Scene Alpha: 0.9
+        Show Scene Geometry: true
+      Scene Robot:
+        Robot Alpha: 0.45
+        Show Scene Robot: true
+      Planned Path:
+        Loop Animation: false
+        Robot Alpha: 0.65
+        Show Robot Collision: false
+        Show Robot Visual: true
+        State Display Time: 0.05 s
+        Trajectory Topic: /display_planned_path
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 0.15
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Cap Sequence
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /cap_sequence_simulation/markers
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Cartesian Safety Sketch
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /cap_workcell/pick_preview_markers
+  Enabled: true
+  Global Options:
+    Background Color: 35; 35; 38
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 0.75
+      Focal Point:
+        X: 0.0
+        Y: 0.0
+        Z: 0.18
+      Name: Sequence Overview
+      Near Clip Distance: 0.01
+      Pitch: 0.45
+      Target Frame: base_link
+      Yaw: 0.75
+Window Geometry:
+  Height: 900
+  Width: 1400

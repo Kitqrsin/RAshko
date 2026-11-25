@@ -11,8 +11,18 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.env.windows
+
+# Local IDE and capture artifacts
+.vs/
+artifacts/
 
 # Camera stream shared frame
 .camera_frame.jpg
 .camera_frame.jpg.tmp
 .cam_frames/
+
+# Machine-specific measured workcell/camera calibration (examples stay tracked)
+config/cap_workcell.yaml
+config/gripper_camera.yaml
+config/cap_fixture.svg

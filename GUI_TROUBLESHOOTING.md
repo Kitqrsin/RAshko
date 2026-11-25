@@ -12,7 +12,7 @@
 
 **Start the GUI:**
 ```bash
-/home/tnt/arm_project/Robotic-Arm---Jarvis/ros2-access.sh start \
+/home/tnt/arm_project/RAshko/ros2-access.sh start \
   "cd /workspace && colcon build --packages-select arm_controller && \
    source install/setup.bash && \
    ros2 launch /workspace/view_with_gui.launch.py"
@@ -80,7 +80,7 @@ data:
 
 **On Raspberry Pi:**
 ```bash
-cd /home/tnt/arm_project/Robotic-Arm---Jarvis
+cd /home/tnt/arm_project/RAshko
 source install/setup.bash
 
 # Run hardware interface

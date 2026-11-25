@@ -1,0 +1,160 @@
+# EXAMPLE ONLY. Copy this file to config/cap_workcell.yaml, replace every
+# illustrative measurement with a physical measurement, then leave
+# commissioned=false until all validation gates in instructions.md pass.
+schema_version: 1
+example_only: true
+commissioned: false
+
+fixture:
+  frame_id: battery_fixture
+  # Mandatory ROS convention when viewing the printed face: origin at the
+  # lower-left, +X right, +Y toward the page top, and +Z out of the page. This
+  # is right-handed; the SVG generator inverts page-pixel Y when printing.
+  coordinate_convention: right_handed_z_up
+  # Illustrative 240 x 160 mm planar board. Coordinates use metres and one
+  # common plane. ArUco corner order is physical TL, TR, BR, BL as printed.
+  workspace_bounds_m: [0.000, 0.000, 0.240, 0.160]
+  marker_corners_m:
+    10: [[0.000, 0.160], [0.025, 0.160], [0.025, 0.135], [0.000, 0.135]]
+    11: [[0.215, 0.160], [0.240, 0.160], [0.240, 0.135], [0.215, 0.135]]
+    12: [[0.215, 0.025], [0.240, 0.025], [0.240, 0.000], [0.215, 0.000]]
+    13: [[0.000, 0.025], [0.025, 0.025], [0.025, 0.000], [0.000, 0.000]]
+
+caps:
+  # Measured 205 mm-wide row: seven 8.3 mm caps at 30 mm centre pitch, with
+  # equal 12.5 mm end margins. The 20 mm row setback is still provisional.
+  source_slots:
+    - {id: cap_0, x_m: 0.0125, y_m: 0.020, search_radius_m: 0.012, expected_radius_m: 0.00415, max_center_error_m: 0.002}
+    - {id: cap_1, x_m: 0.0425, y_m: 0.020, search_radius_m: 0.012, expected_radius_m: 0.00415, max_center_error_m: 0.002}
+    - {id: cap_2, x_m: 0.0725, y_m: 0.020, search_radius_m: 0.012, expected_radius_m: 0.00415, max_center_error_m: 0.002}
+    - {id: cap_3, x_m: 0.1025, y_m: 0.020, search_radius_m: 0.012, expected_radius_m: 0.00415, max_center_error_m: 0.002}
+    - {id: cap_4, x_m: 0.1325, y_m: 0.020, search_radius_m: 0.012, expected_radius_m: 0.00415, max_center_error_m: 0.002}
+    - {id: cap_5, x_m: 0.1625, y_m: 0.020, search_radius_m: 0.012, expected_radius_m: 0.00415, max_center_error_m: 0.002}
+    - {id: cap_6, x_m: 0.1925, y_m: 0.020, search_radius_m: 0.012, expected_radius_m: 0.00415, max_center_error_m: 0.002}
+
+camera:
+  image_topic: /camera/image_raw
+  camera_info_topic: /camera/camera_info
+  # Intrinsic calibration is not needed for raw, iterative pixel centering.
+  # This keeps metric fixture localization and all hardware authorization off.
+  require_calibrated_camera_info: false
+  # The real seven caps form one collinear row. This mode validates their
+  # left-to-right order and repeatability but cannot infer a full 2D pose.
+  localization_mode: fixed_cap_row
+  # Legacy non-collinear-jig field; unused by fixed_cap_row.
+  fixed_jig_reference:
+    plane_to_image_homography: [null, null, null, null, null, null, null, null, null]
+    image_size_px: [640, 480]
+    verified: false
+  # Measure this 2x2 mapping with small, high-Z tool moves. Rows are base X/Y
+  # metres per image U/V pixel. It must never contain a Z component.
+  visual_servo:
+    target_pixel: [320.0, 240.0]
+    correction_matrix_m_per_px: [null, null, null, null]
+    max_step_m: 0.002
+    centered_tolerance_px: 2.0
+    acquisition_radius_px: 80.0
+    ambiguity_margin_px: 25.0
+    required_stable_frames: 3
+    max_iterations: 12
+    verified: false
+  # Filled only after intrinsic calibration and repeated stationary views of
+  # the printed ArUco fixture. XYZW rotates camera axes into the fixture frame.
+  # Keep verified=false until removal/reposition repeatability is measured.
+  fixture_pose_reference:
+    position_fixture_m: [null, null, null]
+    orientation_fixture_from_camera_xyzw: [null, null, null, null]
+    verified: false
+
+observation:
+  maximum_image_age_s: 0.25
+  minimum_stability_duration_s: 1.0
+  joint_settle_time_s: 0.75
+  joint_motion_threshold_deg: 0.25
+  # Six canonical logical degrees; measure a pose that sees all tags/caps.
+  joint_positions_deg: [null, null, null, null, null, null]
+  pose_tolerance_deg: 0.5
+  expected_present_ids: [cap_0, cap_1, cap_2, cap_3, cap_4, cap_5, cap_6]
+
+perception:
+  pixels_per_meter: 4000.0
+  min_visible_markers: 3
+  ransac_threshold_px: 2.0
+  max_reprojection_rms_px: 1.0
+  max_reprojection_error_px: 2.5
+  stability_frames: 8
+  max_homography_jitter_px: 2.0
+  max_cap_center_jitter_m: 0.001
+  # A fixed red jig has no live 3-D pose fiducials. Intrinsic calibration,
+  # mechanical stops, the observation joint pose, and close-up visual
+  # centering are therefore mandatory; this flag must remain false in this mode.
+  require_fixture_pose: false
+  max_fixture_pose_reprojection_rms_px: 1.0
+  max_camera_translation_jitter_m: 0.0015
+  max_camera_rotation_jitter_deg: 0.5
+  max_camera_reference_translation_error_m: 0.003
+  max_camera_reference_rotation_error_deg: 1.0
+  # Replace these broad example values from captured commissioning images.
+  min_grayscale_mean: 10.0
+  max_grayscale_mean: 250.0
+  min_laplacian_variance: 2.0
+
+# All values below remain null until physically measured. The camera-only node
+# ignores them; every autonomous/hardware gate treats them as blockers.
+geometry:
+  # These attestations must only become true after physical measurement.
+  fixture_plane_is_level: false
+  marker_plane_at_cap_top: false
+  protected_regions_measured: false
+  destination_clearance_verified: false
+  fixture_in_base: {x_m: null, y_m: null, z_m: null, yaw_deg: null}
+  battery:
+    x_min_m: null
+    x_max_m: null
+    y_min_m: null
+    y_max_m: null
+    bottom_z_fixture_m: null
+    top_z_fixture_m: null
+  safe_transit_z_base_m: null
+  grasp_tool_z_base_m: null
+  gripper_outer_width_m: null
+  cap_radius_m: 0.00415
+  pose_uncertainty_m: 0.003
+  collision_padding_m: 0.002
+  minimum_vertical_clearance_m: 0.040
+  # Maximum distance the gripper or grasped cap hangs below the transit TCP.
+  tool_payload_below_tcp_m: null
+  # Each terminal/lip requires its fixture-plane circle and physical top Z.
+  # Null placeholders intentionally keep every Cartesian sketch locked.
+  protected_regions:
+    - {id: positive_terminal, x_m: null, y_m: null, radius_m: null, top_z_fixture_m: null}
+    - {id: negative_terminal, x_m: null, y_m: null, radius_m: null, top_z_fixture_m: null}
+  destination_slots:
+    - {id: place_0, x_base_m: null, y_base_m: null, z_base_m: null}
+    - {id: place_1, x_base_m: null, y_base_m: null, z_base_m: null}
+    - {id: place_2, x_base_m: null, y_base_m: null, z_base_m: null}
+    - {id: place_3, x_base_m: null, y_base_m: null, z_base_m: null}
+    - {id: place_4, x_base_m: null, y_base_m: null, z_base_m: null}
+    - {id: place_5, x_base_m: null, y_base_m: null, z_base_m: null}
+    - {id: place_6, x_base_m: null, y_base_m: null, z_base_m: null}
+  # Explicitly verify each physical transfer; list ordering is never used as
+  # an implicit source-to-destination contract.
+  source_destination_map:
+    cap_0: place_0
+    cap_1: place_1
+    cap_2: place_2
+    cap_3: place_3
+    cap_4: place_4
+    cap_5: place_5
+    cap_6: place_6
+
+gripper:
+  open_degrees: 0.0
+  close_degrees: null
+  physically_measured: false
+
+execution:
+  backend: simulation
+  hardware_execution_permitted: false
+  require_runtime_manual_arm: true
+  require_confirmation_each_pick: true

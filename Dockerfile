@@ -1,6 +1,6 @@
 FROM ros:humble
 
-# ---- System dependencies (single layer) ----
+# Windows-side ROS, visualization, planning, and camera dependencies.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-colcon-common-extensions \
@@ -10,38 +10,39 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-rviz2 \
     ros-humble-robot-state-publisher \
     ros-humble-moveit \
+    ros-humble-camera-calibration \
     python3-tk \
-    libcap-dev \
     libatlas-base-dev \
     v4l-utils \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# ---- Python dependencies (single layer, no cache) ----
+# LLM HANDOFF: keep this CPU index explicit. The default resolver installs
+# several gigabytes of CUDA libraries that Docker Desktop does not use here.
+RUN pip3 install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch \
+    torchvision
+
+# NumPy stays below 2 for ROS Humble binary-extension compatibility. Keep one
+# OpenCV distribution; installing both GUI and headless wheels corrupts cv2.
 RUN pip3 install --no-cache-dir \
     "Flask>=3.0,<4.0" \
-    "Flask-Cors>=4.0" \
-    gpiozero==2.0.1 \
-    lgpio \
-    adafruit-circuitpython-pca9685 \
-    adafruit-circuitpython-servokit \
-    numpy \
+    "numpy<2" \
     Pillow \
     "Werkzeug>=2.0" \
-    "pytest>=7.0" \
-    opencv-python-headless \
+    "pytest>=7.0,<8.0" \
+    "packaging>=24.0,<25.0" \
+    "opencv-contrib-python>=4.6,<4.12" \
     ultralytics \
-    moveit-commander \
     py_trees \
+    && pip3 uninstall -y opencv-python \
+    && pip3 install --no-cache-dir --force-reinstall --no-deps \
+        "opencv-contrib-python>=4.6,<4.12" \
     && pip3 cache purge 2>/dev/null || true
-
-# Install picamera2 (optional — works only on Raspberry Pi OS with libcamera)
-# Falls back to OpenCV if libcamera is not available at runtime
-RUN pip3 install --no-cache-dir picamera2 || echo "picamera2 install skipped (libcamera not available)"
 
 WORKDIR /workspace
 
-# Source ROS2 on container start
 RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
 RUN echo "if [ -f /workspace/install/setup.bash ]; then source /workspace/install/setup.bash; fi" >> ~/.bashrc
 

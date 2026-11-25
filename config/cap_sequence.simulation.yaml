@@ -1,0 +1,121 @@
+# MEASUREMENT-INFORMED OFFLINE SCENE ONLY. This scene cannot command hardware.
+# The 205 mm battery width, 140 mm body, 20 mm cap projection, 8.3 mm cap
+# diameter, 30 mm cap pitch, and 120 mm plate-to-battery gap come from the
+# operator's measurements. Battery depth, cap-row setback, black-post geometry,
+# and the destination tray remain conservative simulation assumptions.
+schema_version: 1
+configuration_kind: cap_sequence_simulation
+simulation_only: true
+synthetic_scene: true
+frame_id: base_link
+
+execution:
+  backend: simulation
+  hardware_execution_permitted: false
+
+# CAD-derived base_link references (robot_fixed.urdf + part_1.stl):
+#   battery-facing edge of the empty second aluminum plate: X=-0.043047 m
+#   base rotation axis:                                      X=+0.028402 m
+#   common support surface / aluminum plate bottom:          Z=-0.015935 m
+# The motor occupies the opposite (+X) side, so the battery is placed toward
+# -X. Its near face is 120 mm beyond that aluminum edge: X=-0.163047 m, or
+# about 191.449 mm from the actual rotation axis.
+scene:
+  collision_padding_m: 0.002
+  table:
+    id: synthetic_table
+    center_m: [-0.090000, 0.020000, -0.025935]
+    size_m: [0.340000, 0.280000, 0.020000]
+  battery:
+    id: synthetic_battery
+    # The 75 mm depth is provisional; measure front-to-back depth before any
+    # hardware planning. Width and body height are measured.
+    center_m: [-0.200547, -0.001966, 0.054065]
+    size_m: [0.075000, 0.205000, 0.140000]
+  protected_objects:
+    # Conservative placeholders for the dark posts behind the red-cap row.
+    # Their 60 mm setback, 10 mm radius, and 40 mm height are NOT measured.
+    - {id: synthetic_post_0, center_xy_m: [-0.223047, -0.091966], bottom_z_m: 0.124065, radius_m: 0.010, height_m: 0.040}
+    - {id: synthetic_post_1, center_xy_m: [-0.223047, -0.061966], bottom_z_m: 0.124065, radius_m: 0.010, height_m: 0.040}
+    - {id: synthetic_post_2, center_xy_m: [-0.223047, -0.031966], bottom_z_m: 0.124065, radius_m: 0.010, height_m: 0.040}
+    - {id: synthetic_post_3, center_xy_m: [-0.223047, -0.001966], bottom_z_m: 0.124065, radius_m: 0.010, height_m: 0.040}
+    - {id: synthetic_post_4, center_xy_m: [-0.223047, 0.028034], bottom_z_m: 0.124065, radius_m: 0.010, height_m: 0.040}
+    - {id: synthetic_post_5, center_xy_m: [-0.223047, 0.058034], bottom_z_m: 0.124065, radius_m: 0.010, height_m: 0.040}
+    - {id: synthetic_post_6, center_xy_m: [-0.223047, 0.088034], bottom_z_m: 0.124065, radius_m: 0.010, height_m: 0.040}
+  tray:
+    id: synthetic_destination_tray
+    center_m: [-0.030000, 0.100000, -0.014935]
+    size_m: [0.140000, 0.090000, 0.002000]
+  cap:
+    radius_m: 0.00415
+    height_m: 0.0200
+
+motion:
+  # The CAD gripper extends 35 mm below tool_tip. The grasp/place tool target
+  # is therefore above the cap top; it must never be treated as cap surface Z.
+  safe_transit_z_m: 0.210000
+  grasp_tool_z_m: 0.151065
+  place_tool_z_m: 0.013065
+  minimum_vertical_clearance_m: 0.0050
+  tool_payload_below_tcp_m: 0.0370
+  tool_elevation_deg: -90.0
+
+# These are logical simulation endpoints. The closed value matches the SRDF
+# named state (1.2 rad); it is not a physical gripper calibration.
+gripper:
+  open_degrees: 0.0
+  closed_degrees: 68.7549354157
+
+# One measured 30 mm-pitch row across the 205 mm battery width. The row is
+# provisionally 20 mm behind the near face; that setback still needs measuring.
+sources:
+  - {id: cap_0, x_m: -0.183047, y_m: -0.091966}
+  - {id: cap_1, x_m: -0.183047, y_m: -0.061966}
+  - {id: cap_2, x_m: -0.183047, y_m: -0.031966}
+  - {id: cap_3, x_m: -0.183047, y_m: -0.001966}
+  - {id: cap_4, x_m: -0.183047, y_m: 0.028034}
+  - {id: cap_5, x_m: -0.183047, y_m: 0.058034}
+  - {id: cap_6, x_m: -0.183047, y_m: 0.088034}
+
+destinations:
+  - {id: place_0, x_m: -0.0820, y_m: 0.0800}
+  - {id: place_1, x_m: -0.0470, y_m: 0.0800}
+  - {id: place_2, x_m: -0.0120, y_m: 0.0800}
+  - {id: place_3, x_m: 0.0230, y_m: 0.0800}
+  - {id: place_4, x_m: -0.0470, y_m: 0.1150}
+  - {id: place_5, x_m: -0.0120, y_m: 0.1150}
+  - {id: place_6, x_m: 0.0230, y_m: 0.1150}
+
+source_destination_map:
+  cap_0: place_0
+  cap_1: place_1
+  cap_2: place_2
+  cap_3: place_3
+  cap_4: place_4
+  cap_5: place_5
+  cap_6: place_6
+
+# Synthetic eye-in-hand camera. Deliberate coarse XY errors force the arm to
+# centre a rendered red cap through bounded camera corrections before Z descent.
+# These values are simulation-only and are not physical camera calibration.
+visual_servo:
+  enabled: true
+  image_size_px: [640, 480]
+  target_pixel: [320.0, 240.0]
+  # Current camera snapshot shows an 8.3 mm cap at roughly 70 px diameter.
+  cap_radius_px: 35
+  metres_per_pixel_xy: [0.00012, 0.00012]
+  max_step_m: 0.003
+  centered_tolerance_px: 2.0
+  acquisition_radius_px: 80.0
+  ambiguity_margin_px: 25.0
+  required_stable_frames: 3
+  max_iterations: 10
+  coarse_offsets_xy_m:
+    cap_0: [0.0040, -0.0020]
+    cap_1: [-0.0030, 0.0025]
+    cap_2: [0.0020, 0.0035]
+    cap_3: [-0.0040, -0.0020]
+    cap_4: [0.0030, -0.0030]
+    cap_5: [-0.0025, 0.0030]
+    cap_6: [0.0035, 0.0020]

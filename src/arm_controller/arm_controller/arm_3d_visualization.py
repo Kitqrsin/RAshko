@@ -10,12 +10,22 @@ from tkinter import ttk
 import math
 import numpy as np
 
+from arm_controller.joint_contract import HOME_DEGREES, servo_degrees_to_radians
+
 
 class Arm3DVisualization:
     """
     3D visualization of the robot arm with a draggable IK target point.
     Uses a simple orthographic projection to render the arm and target.
     """
+
+    RENDER_INTERVAL_MS = 16
+    DRAG_IK_INTERVAL_MS = 33
+    DRAW_ARM = 1
+    DRAW_TARGET = 2
+    DRAW_FULL = 4
+    JOINT_COLORS = ('#888888', '#6666aa', '#66aa66', '#aa6666', '#66aaaa')
+    LINK_COLORS = ('#888888', '#666699', '#669966', '#996666')
     
     def __init__(self, parent_frame, ik_solver, on_target_move_callback=None):
         """
@@ -41,6 +51,8 @@ class Arm3DVisualization:
         self.zoom = 550  # Pixels per meter (lower = wider FOV)
         self.center_offset_x = self.canvas_width // 2
         self.center_offset_y = self.canvas_height - 60
+        self._projection_view_key = None
+        self._projection_trig = None
         
         # Target position (meters)
         # Increased for 5-joint arm with extended reach
@@ -49,8 +61,8 @@ class Arm3DVisualization:
         self.target_z = 0.22
         
         # Current joint angles (degrees)
-        self.joint_angles = [90.0] * 6
-        
+        self.joint_angles = list(HOME_DEGREES)
+
         # Actual gripper position from FK/TF (meters) - separate from computed position
         self.actual_gripper_x = 0.0
         self.actual_gripper_y = 0.0
@@ -70,7 +82,13 @@ class Arm3DVisualization:
         
         # Auto-follow mode: gripper tracks target in real-time during drag
         self.auto_follow = False
-        self._drag_ik_pending = False
+        self._drag_ik_after_id = None
+        self._draw_after_id = None
+        self._draw_dirty = 0
+        self._arm_item_ids = []
+        self._gripper_item_ids = []
+        self._target_item_ids = []
+        self._position_label_text = None
         
         # Callback for when user wants to move arm to target
         self.on_move_to_target = None
@@ -168,14 +186,19 @@ class Arm3DVisualization:
         ).pack(side=tk.RIGHT, padx=2)
         
         # Position display
+        position_text = (
+            f"Target: X={self.target_x*1000:.0f} "
+            f"Y={self.target_y*1000:.0f} Z={self.target_z*1000:.0f} mm"
+        )
         self.pos_label = tk.Label(
             self.frame,
-            text=f"Target: X={self.target_x*1000:.0f} Y={self.target_y*1000:.0f} Z={self.target_z*1000:.0f} mm",
+            text=position_text,
             font=('Arial', 9),
             bg='#3b3b3b',
             fg='#00ffff'
         )
         self.pos_label.pack(pady=2)
+        self._position_label_text = position_text
         
         # Instructions (updated when auto_follow changes)
         self.instructions_label = tk.Label(
@@ -197,18 +220,27 @@ class Arm3DVisualization:
         Returns:
             tuple: (screen_x, screen_y)
         """
-        # Convert view angles to radians
-        az = math.radians(self.view_azimuth)
-        el = math.radians(self.view_elevation)
+        view_key = (self.view_azimuth, self.view_elevation)
+        if getattr(self, '_projection_view_key', None) != view_key:
+            az = math.radians(self.view_azimuth)
+            el = math.radians(self.view_elevation)
+            self._projection_view_key = view_key
+            self._projection_trig = (
+                math.cos(az),
+                math.sin(az),
+                math.cos(el),
+                math.sin(el),
+            )
+        cos_az, sin_az, cos_el, sin_el = self._projection_trig
         
         # Rotate around vertical axis (azimuth)
-        x_rot = x * math.cos(az) - y * math.sin(az)
-        y_rot = x * math.sin(az) + y * math.cos(az)
+        x_rot = x * cos_az - y * sin_az
+        y_rot = x * sin_az + y * cos_az
         z_rot = z
         
         # Rotate around horizontal axis (elevation)
-        y_final = y_rot * math.cos(el) - z_rot * math.sin(el)
-        z_final = y_rot * math.sin(el) + z_rot * math.cos(el)
+        y_final = y_rot * cos_el - z_rot * sin_el
+        z_final = y_rot * sin_el + z_rot * cos_el
         
         # Project to screen (orthographic)
         screen_x = self.center_offset_x + x_rot * self.zoom
@@ -219,6 +251,9 @@ class Arm3DVisualization:
     def draw_scene(self):
         """Draw the complete 3D scene"""
         self.canvas.delete('all')
+        self._arm_item_ids = []
+        self._gripper_item_ids = []
+        self._target_item_ids = []
         
         # Draw grid on XY plane
         self.draw_grid()
@@ -237,7 +272,62 @@ class Arm3DVisualization:
         
         # Draw the target point (orange - where user wants to move)
         self.draw_target()
-    
+
+        self._draw_dirty = 0
+
+    def request_draw(self, components=None):
+        """Coalesce redraws while retaining unchanged canvas layers."""
+        if components is None:
+            components = self.DRAW_FULL
+
+        dirty = getattr(self, '_draw_dirty', 0)
+        if components & self.DRAW_FULL:
+            self._draw_dirty = self.DRAW_FULL
+        elif not dirty & self.DRAW_FULL:
+            self._draw_dirty = dirty | components
+
+        if self._draw_after_id is not None:
+            return False
+        self._draw_after_id = self.canvas.after(
+            self.RENDER_INTERVAL_MS,
+            self._flush_draw,
+        )
+        return True
+
+    def _flush_draw(self):
+        self._draw_after_id = None
+        dirty = getattr(self, '_draw_dirty', self.DRAW_FULL)
+        self._draw_dirty = 0
+
+        if dirty & self.DRAW_FULL:
+            self.draw_scene()
+            return
+
+        if dirty & self.DRAW_ARM:
+            self.draw_arm()
+            self.draw_gripper_marker()
+
+        if dirty & self.DRAW_TARGET:
+            self.draw_target()
+            self.update_position_label()
+
+    def cancel_pending_callbacks(self):
+        """Cancel callbacks using the canvas that registered them."""
+        self._cancel_drag_callback()
+        if self._draw_after_id is not None:
+            self.canvas.after_cancel(self._draw_after_id)
+            self._draw_after_id = None
+
+    def _cancel_drag_callback(self):
+        if self._drag_ik_after_id is not None:
+            self.canvas.after_cancel(self._drag_ik_after_id)
+            self._drag_ik_after_id = None
+
+    @staticmethod
+    def _items_exist(items, expected_count):
+        """Return whether a retained canvas layer is ready for coordinate updates."""
+        return len(items) == expected_count
+
     def draw_grid(self):
         """Draw a grid on the XY plane"""
         grid_size = 0.3  # 300mm
@@ -247,12 +337,16 @@ class Arm3DVisualization:
             # Lines parallel to X
             x1, y1 = self.project_3d_to_2d(i, -grid_size, 0)
             x2, y2 = self.project_3d_to_2d(i, grid_size, 0)
-            self.canvas.create_line(x1, y1, x2, y2, fill='#333355', width=1)
+            self.canvas.create_line(
+                x1, y1, x2, y2, fill='#333355', width=1, tags='grid'
+            )
             
             # Lines parallel to Y
             x1, y1 = self.project_3d_to_2d(-grid_size, i, 0)
             x2, y2 = self.project_3d_to_2d(grid_size, i, 0)
-            self.canvas.create_line(x1, y1, x2, y2, fill='#333355', width=1)
+            self.canvas.create_line(
+                x1, y1, x2, y2, fill='#333355', width=1, tags='grid'
+            )
     
     def draw_axes(self):
         """Draw coordinate axes"""
@@ -262,20 +356,32 @@ class Arm3DVisualization:
         # X-axis (red)
         x_end = self.project_3d_to_2d(axis_length, 0, 0)
         self.canvas.create_line(origin[0], origin[1], x_end[0], x_end[1], 
-                               fill='#ff4444', width=2, arrow=tk.LAST)
-        self.canvas.create_text(x_end[0] + 10, x_end[1], text='X', fill='#ff4444', font=('Arial', 9))
+                               fill='#ff4444', width=2, arrow=tk.LAST,
+                               tags='axes')
+        self.canvas.create_text(
+            x_end[0] + 10, x_end[1], text='X', fill='#ff4444',
+            font=('Arial', 9), tags='axes'
+        )
         
         # Y-axis (green)
         y_end = self.project_3d_to_2d(0, axis_length, 0)
         self.canvas.create_line(origin[0], origin[1], y_end[0], y_end[1], 
-                               fill='#44ff44', width=2, arrow=tk.LAST)
-        self.canvas.create_text(y_end[0] + 10, y_end[1], text='Y', fill='#44ff44', font=('Arial', 9))
+                               fill='#44ff44', width=2, arrow=tk.LAST,
+                               tags='axes')
+        self.canvas.create_text(
+            y_end[0] + 10, y_end[1], text='Y', fill='#44ff44',
+            font=('Arial', 9), tags='axes'
+        )
         
         # Z-axis (blue)
         z_end = self.project_3d_to_2d(0, 0, axis_length)
         self.canvas.create_line(origin[0], origin[1], z_end[0], z_end[1], 
-                               fill='#4444ff', width=2, arrow=tk.LAST)
-        self.canvas.create_text(z_end[0] + 10, z_end[1], text='Z', fill='#4444ff', font=('Arial', 9))
+                               fill='#4444ff', width=2, arrow=tk.LAST,
+                               tags='axes')
+        self.canvas.create_text(
+            z_end[0] + 10, z_end[1], text='Z', fill='#4444ff',
+            font=('Arial', 9), tags='axes'
+        )
     
     def draw_workspace(self):
         """Draw approximate reachable workspace boundary"""
@@ -299,7 +405,10 @@ class Arm3DVisualization:
                         points.extend([sx, sy])
                     
                     if len(points) >= 4:
-                        self.canvas.create_line(points, fill='#334433', width=1, smooth=True)
+                        self.canvas.create_line(
+                            points, fill='#334433', width=1, smooth=True,
+                            tags='workspace'
+                        )
     
     def draw_arm(self):
         """Draw the robot arm based on current joint angles.
@@ -314,82 +423,70 @@ class Arm3DVisualization:
         # Get joint positions using forward kinematics
         positions = self.calculate_arm_positions()
         
-        # Joint colors matching the robot (5 joints)
-        joint_colors = ['#888888', '#6666aa', '#66aa66', '#aa6666', '#66aaaa']
-        joint_names = ['Base', 'Shoulder', 'Elbow', 'Wrist', 'Gripper']
-        
-        # Link colors
-        link_colors = ['#888888', '#666699', '#669966', '#996666']
-        
-        # Draw links first (behind joints)
+        projected = [self.project_3d_to_2d(*position) for position in positions]
+        item_ids = getattr(self, '_arm_item_ids', [])
+
+        # Create the layer once. Subsequent frames only update coordinates,
+        # avoiding delete/create traffic through Tk (and through X11 on Windows).
+        if not self._items_exist(item_ids, 9):
+            item_ids = []
+            # Draw links first (behind joints)
+            for i in range(len(positions) - 1):
+                x1, y1 = projected[i]
+                x2, y2 = projected[i + 1]
+                item_ids.append(self.canvas.create_line(
+                    x1, y1, x2, y2,
+                    fill=self.LINK_COLORS[i % len(self.LINK_COLORS)], width=6,
+                    tags='arm'
+                ))
+
+            # Draw all 5 joints
+            for i, (jx, jy) in enumerate(projected):
+                color = (
+                    self.JOINT_COLORS[i]
+                    if i < len(self.JOINT_COLORS)
+                    else '#aaaaaa'
+                )
+                radius = 7 if i == 4 else 5
+                item_ids.append(self.canvas.create_oval(
+                    jx - radius, jy - radius, jx + radius, jy + radius,
+                    fill=color, outline='#ffffff', width=1, tags='arm'
+                ))
+            self._arm_item_ids = item_ids
+            return
+
+        # Retained-mode update: four links followed by five joint circles.
         for i in range(len(positions) - 1):
-            p1 = positions[i]
-            p2 = positions[i + 1]
-            
-            x1, y1 = self.project_3d_to_2d(*p1)
-            x2, y2 = self.project_3d_to_2d(*p2)
-            
-            # Draw link
-            self.canvas.create_line(x1, y1, x2, y2, fill=link_colors[i % len(link_colors)], width=6)
-        
-        # Draw all 5 joints
-        for i, pos in enumerate(positions):
-            jx, jy = self.project_3d_to_2d(*pos)
-            color = joint_colors[i] if i < len(joint_colors) else '#aaaaaa'
-            
-            # Draw joint circle (larger for gripper)
+            x1, y1 = projected[i]
+            x2, y2 = projected[i + 1]
+            self.canvas.coords(item_ids[i], x1, y1, x2, y2)
+
+        for i, (jx, jy) in enumerate(projected):
             radius = 7 if i == 4 else 5
-            self.canvas.create_oval(
+            self.canvas.coords(
+                item_ids[4 + i],
                 jx - radius, jy - radius, jx + radius, jy + radius,
-                fill=color, outline='#ffffff', width=1
             )
     
     def calculate_arm_positions(self):
-        """Calculate 3D positions of arm joints for schematic visualization.
-        
-        This matches the RViz model EXACTLY using URDF joint origins.
-        5 motor joints: base, shoulder, elbow, forearm (wrist), gripper
-        
-        Uses the same angle conversions as send_command() in arm_gui.py:
-        - Shoulder and Elbow: INVERTED (90.0 - pos) to match RViz
-        - Others: Normal (pos - 90.0)
-        
-        At 90° (home position), the arm should point straight up.
+        """Return the original five-point geometric arm schematic.
+
+        The canvas and mouse IK intentionally share ``ArmIKSolver`` geometry.
+        Fixed URDF/TF frame origins are not motor joints and must never be
+        appended to this schematic.
         """
-        # Get joint angles in degrees (GUI convention)
-        base = self.joint_angles[0]
-        shoulder = self.joint_angles[1]
-        elbow = self.joint_angles[2]
-        forearm = self.joint_angles[3]
-        wrist_rotate = self.joint_angles[4] if len(self.joint_angles) > 4 else 90.0
-        
-        # Convert to radians for Tkinter visualization
-        # MUST MATCH RViz conversions in arm_gui.py send_command()
-        
-        # Base: 90° = pointing along +X axis (normal conversion)
-        base_rad = math.radians(base - 90.0)
-        
-        # Shoulder: INVERTED to match RViz (90.0 - pos)
-        shoulder_rad = math.radians(90.0 - shoulder)
-        
-        # Elbow: INVERTED to match RViz (90.0 - pos)
-        elbow_rad = math.radians(90.0 - elbow)
-        
-        # Forearm/Wrist pitch - INVERTED (matches IK encode: f_deg = 90 - deg(rad))
-        # Must decode the same way as shoulder/elbow for correct FK round-trip
-        forearm_rad = math.radians(90.0 - forearm)
-        
-        # Link lengths from URDF joint origin xyz values (in meters)
-        # Measured from robot_fixed.urdf joint definitions:
-        # base joint: xyz="0.0284017 -0.00137038 0.0592971" -> z=0.059
-        # shoulder joint: xyz="-0.0281584 0.0201485 0.0113428" -> ~0.036
-        # elbow joint: xyz="-0.000476914 0.0841198 -0.00387217" -> y=0.084
-        # wrist joint: xyz="0.0565214 0.0648797 -0.000297974" -> dist=0.086
-        # wrist_rotate joint: xyz="0.0475547 0.0385425 0.027714" -> dist=0.061
-        L_base = 0.059       # Base to shoulder height (base joint z)
-        L_upper = 0.084      # Shoulder to elbow (elbow joint y - main link!)
-        L_forearm = 0.074    # Elbow to wrist (shortened for visual match)
-        L_wrist = 0.061      # Wrist to gripper (wrist_rotate joint distance)
+
+        base_rad, shoulder_rad, elbow_rad, forearm_rad = (
+            servo_degrees_to_radians(self.joint_angles)[:4]
+        )
+
+        # Use the same four lengths as the geometric solver.  The historical
+        # canvas used 0.074 m for the forearm while IK used 0.086 m, which left
+        # the green gripper marker short of an otherwise correct target.
+        L_base = self.L1
+        L_upper = self.L2
+        L_forearm = self.L3
+        L_wrist = self.L4
         
         positions = []
         
@@ -401,7 +498,7 @@ class Arm3DVisualization:
         
         # Joint 3: Elbow motor
         # Shoulder rotates the upper arm in vertical plane
-        # At shoulder_rad=0 (GUI 90°), arm points straight up
+        # At shoulder_rad=0 (configured home), arm points straight up
         elbow_x = L_upper * math.sin(shoulder_rad)
         elbow_z = L_base + L_upper * math.cos(shoulder_rad)
         positions.append((
@@ -437,65 +534,85 @@ class Arm3DVisualization:
     def draw_target(self):
         """Draw the draggable target point (orange ball - where user wants arm to go)"""
         tx, ty = self.project_3d_to_2d(self.target_x, self.target_y, self.target_z)
-        
-        # Draw target sphere (larger, orange)
         radius = 12
-        self.canvas.create_oval(
-            tx - radius, ty - radius, tx + radius, ty + radius,
-            fill='#ff8800', outline='#ffffff', width=2,
-            tags='target'
-        )
-        
-        # Draw crosshair
-        self.canvas.create_line(tx - radius - 5, ty, tx + radius + 5, ty, 
-                               fill='#ffaa00', width=1, tags='target')
-        self.canvas.create_line(tx, ty - radius - 5, tx, ty + radius + 5, 
-                               fill='#ffaa00', width=1, tags='target')
-        
-        # Draw projection lines to ground
         ground_x, ground_y = self.project_3d_to_2d(self.target_x, self.target_y, 0)
-        self.canvas.create_line(tx, ty, ground_x, ground_y, 
-                               fill='#cc6600', width=1, dash=(3, 3), tags='target')
-        self.canvas.create_oval(
-            ground_x - 4, ground_y - 4, ground_x + 4, ground_y + 4,
-            fill='#ff8800', outline='', tags='target'
+        item_ids = getattr(self, '_target_item_ids', [])
+
+        if not self._items_exist(item_ids, 6):
+            item_ids = [
+                self.canvas.create_oval(
+                    tx - radius, ty - radius, tx + radius, ty + radius,
+                    fill='#ff8800', outline='#ffffff', width=2, tags='target'
+                ),
+                self.canvas.create_line(
+                    tx - radius - 5, ty, tx + radius + 5, ty,
+                    fill='#ffaa00', width=1, tags='target'
+                ),
+                self.canvas.create_line(
+                    tx, ty - radius - 5, tx, ty + radius + 5,
+                    fill='#ffaa00', width=1, tags='target'
+                ),
+                self.canvas.create_line(
+                    tx, ty, ground_x, ground_y,
+                    fill='#cc6600', width=1, dash=(3, 3), tags='target'
+                ),
+                self.canvas.create_oval(
+                    ground_x - 4, ground_y - 4, ground_x + 4, ground_y + 4,
+                    fill='#ff8800', outline='', tags='target'
+                ),
+                self.canvas.create_text(
+                    tx, ty - radius - 12, text='Target', fill='#ff8800',
+                    font=('Arial', 8, 'bold'), tags='target'
+                ),
+            ]
+            self._target_item_ids = item_ids
+            return
+
+        self.canvas.coords(
+            item_ids[0], tx - radius, ty - radius, tx + radius, ty + radius
         )
-        
-        # Label
-        self.canvas.create_text(
-            tx, ty - radius - 12,
-            text='Target',
-            fill='#ff8800',
-            font=('Arial', 8, 'bold')
+        self.canvas.coords(
+            item_ids[1], tx - radius - 5, ty, tx + radius + 5, ty
         )
+        self.canvas.coords(
+            item_ids[2], tx, ty - radius - 5, tx, ty + radius + 5
+        )
+        self.canvas.coords(item_ids[3], tx, ty, ground_x, ground_y)
+        self.canvas.coords(
+            item_ids[4], ground_x - 4, ground_y - 4, ground_x + 4, ground_y + 4
+        )
+        self.canvas.coords(item_ids[5], tx, ty - radius - 12)
     
     def draw_gripper_marker(self):
-        """Draw the current gripper position (green ball) - at the 5th joint (gripper base)"""
-        # Get the 5th joint position directly from calculated arm positions
-        # This ensures the green dot is exactly on the last joint
+        """Draw the gripper at the final point of the five-point schematic."""
         positions = self.calculate_arm_positions()
-        if len(positions) >= 5:
-            gripper_pos = positions[4]  # 5th joint (index 4)
+        if positions:
+            gripper_pos = positions[-1]
             self.actual_gripper_x = gripper_pos[0]
             self.actual_gripper_y = gripper_pos[1]
             self.actual_gripper_z = gripper_pos[2]
         
         gx, gy = self.project_3d_to_2d(self.actual_gripper_x, self.actual_gripper_y, self.actual_gripper_z)
         
-        # Draw gripper marker (green, slightly smaller)
         radius = 8
-        self.canvas.create_oval(
-            gx - radius, gy - radius, gx + radius, gy + radius,
-            fill='#00ff00', outline='#ffffff', width=2
-        )
-        
-        # Label
-        self.canvas.create_text(
-            gx, gy + radius + 10,
-            text='Gripper',
-            fill='#00ff00',
-            font=('Arial', 8, 'bold')
-        )
+        item_ids = getattr(self, '_gripper_item_ids', [])
+        if not self._items_exist(item_ids, 2):
+            item_ids = [
+                self.canvas.create_oval(
+                    gx - radius, gy - radius, gx + radius, gy + radius,
+                    fill='#00ff00', outline='#ffffff', width=2, tags='gripper'
+                ),
+                self.canvas.create_text(
+                    gx, gy + radius + 10, text='Gripper', fill='#00ff00',
+                    font=('Arial', 8, 'bold'), tags='gripper'
+                ),
+            ]
+            self._gripper_item_ids = item_ids
+        else:
+            self.canvas.coords(
+                item_ids[0], gx - radius, gy - radius, gx + radius, gy + radius
+            )
+            self.canvas.coords(item_ids[1], gx, gy + radius + 10)
         
         # Update the position label to show both
         self.update_position_label()
@@ -523,7 +640,7 @@ class Arm3DVisualization:
     
     def _fire_drag_ik(self):
         """Fire the IK callback after a short throttle delay."""
-        self._drag_ik_pending = False
+        self._drag_ik_after_id = None
         if self.auto_follow and self.on_target_move and self.dragging:
             self.on_target_move(self.target_x, self.target_y, self.target_z)
 
@@ -550,18 +667,24 @@ class Arm3DVisualization:
         """Set the view angle"""
         self.view_azimuth = azimuth
         self.view_elevation = elevation
-        self.draw_scene()
+        self.request_draw(self.DRAW_FULL)
     
     def reset_target(self):
         """Reset target to current gripper position"""
         self.sync_target_to_gripper()
-        self.draw_scene()
+        self.request_draw(self.DRAW_TARGET)
     
     def update_position_label(self):
         """Update the position display label"""
-        self.pos_label.config(
-            text=f"Target: X={self.target_x*1000:.0f} Y={self.target_y*1000:.0f} Z={self.target_z*1000:.0f} mm"
+        text = (
+            f"Target: X={self.target_x*1000:.0f} "
+            f"Y={self.target_y*1000:.0f} Z={self.target_z*1000:.0f} mm"
         )
+        if text == getattr(self, '_position_label_text', None):
+            return False
+        self._position_label_text = text
+        self.pos_label.config(text=text)
+        return True
     
     def is_click_on_target(self, screen_x, screen_y):
         """Check if a click is on the target point"""
@@ -634,23 +757,24 @@ class Arm3DVisualization:
             self.drag_start_x = event.x
             self.drag_start_y = event.y
             
-            # Update display
-            self.update_position_label()
-            self.draw_scene()
+            # The position label is refreshed with the coalesced target frame.
+            self.request_draw(self.DRAW_TARGET)
             
             # If auto-follow is active, trigger IK in real-time as user drags
-            if self.auto_follow and self.on_target_move and not self._drag_ik_pending:
-                self._drag_ik_pending = True
-                # Use after_idle to batch rapid drag events
-                self.canvas.after(80, self._fire_drag_ik)
+            if self.auto_follow and self.on_target_move and self._drag_ik_after_id is None:
+                self._drag_ik_after_id = self.canvas.after(
+                    self.DRAG_IK_INTERVAL_MS,
+                    self._fire_drag_ik,
+                )
     
     def on_mouse_up(self, event):
         """Handle left mouse button release"""
-        if self.dragging and self.auto_follow and self.on_target_move:
+        was_dragging = self.dragging
+        self.dragging = False
+        self._cancel_drag_callback()
+        if was_dragging and self.auto_follow and self.on_target_move:
             # Fire IK one final time at the release position
             self.on_target_move(self.target_x, self.target_y, self.target_z)
-        self.dragging = False
-        self._drag_ik_pending = False
     
     def on_right_mouse_down(self, event):
         """Handle right mouse button down (view rotation)"""
@@ -677,7 +801,7 @@ class Arm3DVisualization:
             self.drag_start_x = event.x
             self.drag_start_y = event.y
             
-            self.draw_scene()
+            self.request_draw(self.DRAW_FULL)
     
     def on_right_mouse_up(self, event):
         """Handle right mouse button release"""
@@ -691,33 +815,39 @@ class Arm3DVisualization:
             self.zoom /= 1.1
         
         self.zoom = max(200, min(2000, self.zoom))
-        self.draw_scene()
+        self.request_draw(self.DRAW_FULL)
     
     def on_mouse_wheel_up(self, event):
         """Handle mouse wheel up (Linux)"""
         self.zoom *= 1.1
         self.zoom = min(2000, self.zoom)
-        self.draw_scene()
+        self.request_draw(self.DRAW_FULL)
     
     def on_mouse_wheel_down(self, event):
         """Handle mouse wheel down (Linux)"""
         self.zoom /= 1.1
         self.zoom = max(200, self.zoom)
-        self.draw_scene()
+        self.request_draw(self.DRAW_FULL)
     
     def set_target(self, x, y, z):
         """Set target position programmatically"""
-        self.target_x = x
-        self.target_y = y
-        self.target_z = z
+        target = (float(x), float(y), float(z))
+        if target == (self.target_x, self.target_y, self.target_z):
+            return False
+        self.target_x, self.target_y, self.target_z = target
         self.update_position_label()
-        self.draw_scene()
+        self.request_draw(self.DRAW_TARGET)
+        return True
     
     def set_joint_angles(self, angles):
         """Update joint angles for arm visualization"""
-        self.joint_angles = list(angles)
-        self.draw_scene()
-    
+        updated = list(angles)
+        if updated == self.joint_angles:
+            return False
+        self.joint_angles = updated
+        self.request_draw(self.DRAW_ARM)
+        return True
+
     def update_from_ik_solution(self, joint_angles_dict):
         """Update arm visualization from IK solution dictionary"""
         ik_to_idx = {
@@ -729,18 +859,24 @@ class Arm3DVisualization:
             'gripper': 5
         }
         
+        updated = list(self.joint_angles)
         for joint, idx in ik_to_idx.items():
             if joint in joint_angles_dict:
-                self.joint_angles[idx] = joint_angles_dict[joint]
+                updated[idx] = joint_angles_dict[joint]
         
         # After IK solution, target should already be at desired position
         # (the target was dragged there), so don't sync back
-        self.draw_scene()
+        return self.set_joint_angles(updated)
     
     def set_actual_gripper_position(self, x, y, z):
         """Set the actual gripper position from FK/TF (for accurate green marker)"""
-        print(f"Tkinter set_actual_gripper_position: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
-        self.actual_gripper_x = x
-        self.actual_gripper_y = y
-        self.actual_gripper_z = z
-        self.draw_scene()
+        position = (float(x), float(y), float(z))
+        if position == (
+            self.actual_gripper_x,
+            self.actual_gripper_y,
+            self.actual_gripper_z,
+        ):
+            return False
+        self.actual_gripper_x, self.actual_gripper_y, self.actual_gripper_z = position
+        self.request_draw(self.DRAW_ARM)
+        return True

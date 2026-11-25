@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Jarvis Robot Arm Control GUI
+RAshko Robot Arm Control GUI
 Simple Tkinter-based control interface for testing ROS2 integration
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+import queue
+import io
+import json
 import math
 import subprocess
 import shutil
 import os
+import signal
 import time
 import struct
 import fcntl
@@ -20,8 +24,9 @@ IN_DOCKER = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv'
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import JointState, Image as ROSImage
-from std_msgs.msg import Float32MultiArray, Float32, Bool
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import CompressedImage, JointState, Image as ROSImage
+from std_msgs.msg import Float32MultiArray, Float32, Bool, String
 from geometry_msgs.msg import Vector3
 from visualization_msgs.msg import Marker
 from builtin_interfaces.msg import Duration
@@ -45,18 +50,16 @@ except ImportError:
 # Import IK solvers and 3D visualization
 from arm_controller.ik_solver import ArmIKSolver
 from arm_controller.arm_3d_visualization import Arm3DVisualization
+from arm_controller.joint_contract import (
+    GRIPPER_OPEN_DEGREES,
+    HOME_DEGREES,
+    JOINT_NAMES as CONTRACT_JOINT_NAMES,
+    radians_to_servo_degrees,
+    servo_degrees_to_radians,
+)
 
 # Import in-process object detector for camera overlay
 from arm_controller.gui_object_detector import GUIObjectDetector
-
-# Try to import MoveIt IK client (optional)
-try:
-    from arm_controller.moveit_ik_client import MoveItIKClient
-    MOVEIT_AVAILABLE = True
-except ImportError:
-    MOVEIT_AVAILABLE = False
-    MoveItIKClient = None
-
 
 # ---------------------------------------------------------------------------
 #  Lightweight PID controller (used by face-follow mode)
@@ -101,11 +104,46 @@ class _PIDController:
 
 
 class ArmControlGUI(Node):
+    FEEDBACK_REFRESH_MS = 33
+    DRAG_IK_POLL_MS = 4
+    DRAG_WIDGET_REFRESH_S = 0.10
+    CAMERA_REFRESH_MS = 16
+    CAMERA_DRAG_REFRESH_MS = 100
+    CAMERA_STALE_S = 2.0
+    LINK_STALE_S = 1.0
+
     def __init__(self, root):
         super().__init__('arm_control_gui')
+        self.camera_feature_enabled = bool(
+            self.declare_parameter('camera_enabled', True).value
+        )
+        self.camera_preview = bool(
+            self.declare_parameter('camera_preview', False).value
+        )
+        gripper_closed_default = (
+            os.environ.get('RASHKO_GRIPPER_CLOSED_DEGREES', '0').strip() or '0'
+        )
+        self.gripper_open_degrees = GRIPPER_OPEN_DEGREES
+        self.gripper_closed_degrees = float(
+            self.declare_parameter(
+                'gripper_closed_degrees', float(gripper_closed_default)
+            ).value
+        )
+        if not (
+            self.gripper_open_degrees
+            <= self.gripper_closed_degrees
+            <= 180.0
+        ):
+            raise ValueError(
+                'gripper_closed_degrees must be within '
+                f'{self.gripper_open_degrees:.1f}..180.0 logical degrees'
+            )
+        self.gripper_calibrated = (
+            self.gripper_closed_degrees > self.gripper_open_degrees
+        )
         
         self.root = root
-        self.root.title("Jarvis Robot Arm Controller")
+        self.root.title("RAshko Robot Arm Controller")
         self.root.geometry("1600x1050")
         self.root.configure(bg='#2b2b2b')
         
@@ -140,29 +178,43 @@ class ArmControlGUI(Node):
         ]
         
         # Current joint positions (in degrees)
-        self.current_positions = [90.0] * 6
-        self.target_positions = [90.0] * 6
+        self.current_positions = list(HOME_DEGREES)
+        self.target_positions = list(HOME_DEGREES)
+        self._rendered_joint_positions = list(HOME_DEGREES)
+        self._pending_initial_feedback = None
+        self._feedback_initialized = False
         
         # Initialize IK solvers
-        # Custom geometric solver as fallback
+        # Keep mouse Cartesian control on the original geometric model.  MoveIt
+        # remains available for its own planning workflows, but its additional
+        # fixed URDF frames are not GUI joints and are not used by drag IK.
         self.custom_ik_solver = ArmIKSolver()
-        # MoveIt IK client (will be initialized after node setup)
-        self.moveit_ik = None
-        self.use_moveit = True  # Prefer MoveIt when available
-        
+        self._ik_solver_lock = threading.Lock()
         # 3D visualization (will be set up in setup_gui)
         self.viz_3d = None
         
         # Camera feed state
-        self.camera_enabled = tk.BooleanVar(value=True)
+        self.camera_enabled = tk.BooleanVar(value=self.camera_feature_enabled)
+        self._camera_active = threading.Event()
+        if self.camera_feature_enabled:
+            self._camera_active.set()
         self.camera_label = None          # Tkinter Label widget for video feed
         self.camera_photo = None          # Current PhotoImage (must keep reference)
         self.latest_camera_frame = None   # Latest numpy RGB frame (set from any source)
         self._camera_lock = threading.Lock()
+        self._preview_ready = threading.Event()
+        self._pending_preview = None
+        self._preview_thread = None
         self._direct_cam_cap = None       # OpenCV VideoCapture (direct fallback)
         self._direct_cam_proc = None      # rpicam-vid subprocess (direct fallback)
         self._direct_cam_backend = None   # 'ros2', 'libcamera', 'opencv', or None
         self._camera_frame_count = 0
+        self._camera_frame_at = 0.0
+        self._displayed_camera_frame_count = -1
+        self._camera_after_id = None
+        self._feedback_after_id = None
+        self._camera_placeholder_text = None
+        self._camera_status = None
         self._camera_snapshot_count = 0
         self.camera_status_label = None
         self.camera_fps_label = None
@@ -232,6 +284,20 @@ class ArmControlGUI(Node):
         self.last_update_time = 0
         self.update_interval = 0.1  # 100ms between updates
         self.cartesian_update_pending = False
+        self._update_after_id = None
+        self._cartesian_update_after_id = None
+        self._interpolation_after_id = None
+
+        # Auto-follow IK runs away from Tk's single UI thread. Only one solve is
+        # active; rapid mouse events replace the queued target with the newest
+        # one instead of building a backlog of stale arm commands.
+        self._drag_ik_result_queue = queue.SimpleQueue()
+        self._drag_ik_running = False
+        self._drag_ik_latest_request = None
+        self._drag_ik_sequence = 0
+        self._drag_ik_generation = 0
+        self._drag_ik_poll_after_id = None
+        self._drag_widget_last_refresh = 0.0
         
         # ROS2 Publishers and Subscribers
         self.joint_pub = self.create_publisher(
@@ -240,18 +306,16 @@ class ArmControlGUI(Node):
             10
         )
         
-        # Also publish to joint_states for visualization
-        self.joint_state_pub = self.create_publisher(
-            JointState,
-            '/joint_states',
-            10
-        )
-        
         self.joint_state_sub = self.create_subscription(
             JointState,
             '/joint_states',
             self.joint_state_callback,
             10
+        )
+        self._pi_status = None
+        self._link_status_text = None
+        self.pi_status_sub = self.create_subscription(
+            String, '/raspberry/status', self._pi_status_callback, 1
         )
         
         # Publisher for target position marker in RViz (orange)
@@ -283,14 +347,19 @@ class ArmControlGUI(Node):
         )
         
         # Subscriber for camera feed from camera_node
-        self.camera_sub = self.create_subscription(
-            ROSImage,
-            '/camera/image_raw',
-            self.camera_image_callback,
-            10
-        )
+        self.camera_sub = None
+        if self.camera_feature_enabled:
+            if self.camera_preview:
+                self.camera_sub = self.create_subscription(
+                    CompressedImage, '/camera/preview/compressed',
+                    self.camera_preview_callback,
+                    QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+                )
+            else:
+                self.camera_sub = self.create_subscription(
+                    ROSImage, '/camera/image_raw', self.camera_image_callback, 1
+                )
         self._ros2_camera_active = False
-        self._ros2_camera_last_time = 0.0
 
         # Subscriber for visual-servoing error vector
         self.vision_error_sub = self.create_subscription(
@@ -303,18 +372,22 @@ class ArmControlGUI(Node):
         # Track emergency stop state
         self.estop_active = False
         
-        # Initialize MoveIt IK client (if available)
-        if MOVEIT_AVAILABLE:
-            self.moveit_ik = MoveItIKClient(self)
-            self.get_logger().info("MoveIt IK client initialized")
-        else:
-            self.moveit_ik = None
-            self.get_logger().warn("MoveIt not available - using custom geometric IK only")
-        
         # GUI Elements
         self.setup_gui()
+        if not self.gripper_calibrated:
+            self.get_logger().warning(
+                "Gripper motion is locked at 0 degrees until "
+                "RASHKO_GRIPPER_CLOSED_DEGREES is calibrated"
+            )
         
         # Start ROS2 spinning in separate thread
+        self._gui_shutdown = threading.Event()
+        if self.camera_feature_enabled and self.camera_preview and PIL_AVAILABLE:
+            self._preview_thread = threading.Thread(
+                target=self._decode_camera_previews, name='rashko-preview-decoder',
+                daemon=True,
+            )
+            self._preview_thread.start()
         self.ros_thread = threading.Thread(target=self.spin_ros, daemon=True)
         self.ros_thread.start()
         
@@ -330,7 +403,7 @@ class ArmControlGUI(Node):
         
         title_label = tk.Label(
             title_frame,
-            text="🤖 Jarvis Robot Arm Controller",
+            text="🤖 RAshko Robot Arm Controller",
             font=('Arial', 20, 'bold'),
             bg='#2b2b2b',
             fg='#00ff00'
@@ -363,6 +436,7 @@ class ArmControlGUI(Node):
         left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         
         self.joint_sliders = []
+        self.joint_values = []
         self.joint_labels = []
         
         for i, joint_name in enumerate(self.joint_names):
@@ -384,7 +458,7 @@ class ArmControlGUI(Node):
             # Current value display
             value_label = tk.Label(
                 joint_frame,
-                text="90.0°",
+                text=f"{HOME_DEGREES[i]:.1f}°",
                 font=('Arial', 10, 'bold'),
                 bg='#3b3b3b',
                 fg='#00ffff',
@@ -393,25 +467,41 @@ class ArmControlGUI(Node):
             value_label.pack(side=tk.LEFT, padx=5)
             self.joint_labels.append(value_label)
             
-            # Base (J1) is limited to 245° for safety (mechanical max ~270°)
-            slider_max = 270 if i == 0 else 180
+            # The gripper remains locked open until its physical close endpoint
+            # has been measured and supplied explicitly.
+            if i == 0:
+                slider_max = 245
+            elif i == 5 and self.gripper_calibrated:
+                slider_max = self.gripper_closed_degrees
+            else:
+                slider_max = 180
             
             # Slider
+            joint_value = tk.DoubleVar(value=HOME_DEGREES[i])
             slider = tk.Scale(
                 joint_frame,
                 from_=0,
                 to=slider_max,
                 orient=tk.HORIZONTAL,
                 resolution=1,
+                variable=joint_value,
                 bg='#3b3b3b',
                 fg='white',
                 highlightbackground='#3b3b3b',
                 troughcolor='#555555',
                 command=lambda val, idx=i: self.on_slider_change(idx, val)
             )
-            slider.set(90)
+            if i == 5 and not self.gripper_calibrated:
+                slider.configure(state=tk.DISABLED)
+                name_label.configure(text="J6: gripper (LOCKED)")
             slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
             self.joint_sliders.append(slider)
+            self.joint_values.append(joint_value)
+            # Take ownership on actual user input, not Scale.set() callbacks
+            # used by the existing camera-driven controls.
+            for event in ('<ButtonPress-1>', '<KeyPress>', '<MouseWheel>',
+                          '<Button-4>', '<Button-5>'):
+                slider.bind(event, self._take_manual_control, add='+')
         
         # Right panel - Quick Actions & Cartesian Control
         right_panel = tk.Frame(main_frame, bg='#2b2b2b')
@@ -425,6 +515,7 @@ class ArmControlGUI(Node):
             realtime_frame,
             text="⚡ Real-time Mode (Auto-Update)",
             variable=self.realtime_mode,
+            command=self._on_realtime_toggle,
             font=('Arial', 11, 'bold'),
             bg='#3b3b3b',
             fg='#ffaa00',
@@ -502,10 +593,10 @@ class ArmControlGUI(Node):
         preset_frame.pack(fill=tk.X, pady=(0, 10))
         
         presets = [
-            ("Home", [90, 90, 90, 90, 90, 90]),
-            ("Zero", [0, 0, 0, 0, 0, 0]),
-            ("Stretch", [90, 45, 45, 90, 90, 90]),
-            ("Rest", [90, 135, 135, 90, 90, 90]),
+            ("Home", list(HOME_DEGREES)),
+            ("Zero", [0, 0, 0, 0, 0, None]),
+            ("Stretch", [90, 45, 45, 90, 90, None]),
+            ("Rest", [90, 135, 135, 90, 90, None]),
         ]
         
         for name, angles in presets:
@@ -533,7 +624,9 @@ class ArmControlGUI(Node):
         
         self.cartesian_entries = {}
         self.cartesian_sliders = {}
+        self.cartesian_values = {}
         self.cartesian_labels = {}
+        self._cartesian_entry_text = {}
         
         # Define ranges for each axis (in millimeters)
         # Extended ranges — base servo supports 270° sweep
@@ -571,12 +664,16 @@ class ArmControlGUI(Node):
             
             # Slider
             min_val, max_val = cartesian_ranges[axis]
+            cartesian_value = tk.DoubleVar(
+                value=0 if axis != 'Z' else 200
+            )
             slider = tk.Scale(
                 axis_frame,
                 from_=min_val,
                 to=max_val,
                 orient=tk.HORIZONTAL,
                 resolution=1,
+                variable=cartesian_value,
                 bg='#3b3b3b',
                 fg='white',
                 highlightbackground='#3b3b3b',
@@ -584,9 +681,9 @@ class ArmControlGUI(Node):
                 showvalue=0,
                 command=lambda val, ax=axis: self.on_cartesian_slider_change(ax, val)
             )
-            slider.set(0 if axis != 'Z' else 200)
             slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
             self.cartesian_sliders[axis] = slider
+            self.cartesian_values[axis] = cartesian_value
             
             # Text entry
             entry = tk.Entry(
@@ -598,11 +695,12 @@ class ArmControlGUI(Node):
                 width=7
             )
             entry.insert(0, "0" if axis != 'Z' else "200")
+            self._cartesian_entry_text[axis] = entry.get()
             entry.bind('<Return>', lambda e, ax=axis: self.on_cartesian_entry_change(ax))
             entry.bind('<FocusOut>', lambda e, ax=axis: self.on_cartesian_entry_change(ax))
             entry.pack(side=tk.LEFT, padx=3)
             self.cartesian_entries[axis] = entry
-        
+
         ik_btn = tk.Button(
             cartesian_frame,
             text="Move to Position (IK)",
@@ -621,8 +719,8 @@ class ArmControlGUI(Node):
         
         self.viz_3d = Arm3DVisualization(
             viz_panel,
-            self.custom_ik_solver,  # Use custom solver for visualization FK
-            on_target_move_callback=self.on_3d_target_move
+            self.custom_ik_solver,
+            on_target_move_callback=self.on_3d_target_move,
         )
         
         # Sync initial cartesian values to 3D viz
@@ -662,7 +760,7 @@ class ArmControlGUI(Node):
             bg='#0066cc',
             fg='white',
             activebackground='#0088ee',
-            command=self.send_command,
+            command=self.send_manual_command,
             height=2
         )
         send_btn.pack(pady=5, padx=10, fill=tk.X)
@@ -694,6 +792,10 @@ class ArmControlGUI(Node):
             pady=5
         )
         self.info_label.pack(fill=tk.X)
+        self.link_status_label = tk.Label(
+            info_frame, bg='#3b3b3b', anchor='w', padx=10, pady=3,
+        )
+        self.link_status_label.pack(fill=tk.X)
     
     # ------------------------------------------------------------------ #
     #  Camera Feed                                                         #
@@ -726,6 +828,8 @@ class ArmControlGUI(Node):
             command=self._on_camera_toggle
         )
         toggle_btn.pack(side=tk.LEFT)
+        if not self.camera_feature_enabled:
+            toggle_btn.configure(state=tk.DISABLED)
 
         snap_btn = tk.Button(
             ctrl_row,
@@ -863,23 +967,55 @@ class ArmControlGUI(Node):
                 )
             return
 
-        # Show an initial placeholder
-        self._show_camera_placeholder("Waiting for camera...")
+        if not self.camera_feature_enabled:
+            self.camera_label.configure(text="Camera disabled for this launch")
+            self.camera_status_label.configure(text="Disabled", fg='#888888')
+            return
 
-        # Start the camera refresh loop (runs on Tkinter main thread)
+        self._show_camera_placeholder("Waiting for camera...")
         self._start_camera_refresh()
 
-        # Kick off the direct-camera fallback probe in a background thread
-        threading.Thread(target=self._init_direct_camera, daemon=True).start()
+        if self.camera_enabled.get() and not self.camera_preview:
+            threading.Thread(target=self._init_direct_camera, daemon=True).start()
 
     # ---- ROS2 camera topic callback (runs in ROS spin thread) ----
+    def camera_preview_callback(self, msg: CompressedImage):
+        """Replace an unprocessed JPEG without blocking ROS feedback."""
+        if not self._camera_active.is_set() or not PIL_AVAILABLE:
+            return
+        if not msg.data or len(msg.data) > 5_000_000:
+            return
+        with self._camera_lock:
+            self._pending_preview = msg.data
+            self._preview_ready.set()
+
+    def _decode_camera_previews(self):
+        while not self._gui_shutdown.is_set():
+            self._preview_ready.wait()
+            with self._camera_lock:
+                data = self._pending_preview
+                self._pending_preview = None
+                self._preview_ready.clear()
+            if data is not None and not self._gui_shutdown.is_set():
+                self._decode_camera_preview(data)
+
+    def _decode_camera_preview(self, data):
+        try:
+            with PILImage.open(io.BytesIO(data), formats=('JPEG',)) as image:
+                if image.width * image.height > 3840 * 2160:
+                    return
+                frame = np.asarray(image.convert('RGB'))
+            if self._camera_active.is_set() and not self._gui_shutdown.is_set():
+                self._store_latest_camera_frame(frame)
+                self._ros2_camera_active = True
+        except (OSError, ValueError, PILImage.DecompressionBombError) as exc:
+            self.get_logger().warn(
+                f'Camera preview decode error: {exc}', throttle_duration_sec=5.0
+            )
+
     def camera_image_callback(self, msg: ROSImage):
         """Receive frames from /camera/image_raw published by camera_node."""
-        if not self.camera_enabled.get():
-            return
-        # Skip heavy ROS2 raw-image decoding when the more efficient
-        # shared-file backend is already feeding frames.
-        if self._direct_cam_backend == 'shared-file':
+        if not self._camera_active.is_set():
             return
         # Skip heavy ROS2 raw-image decoding when the more efficient
         # shared-file backend is already feeding frames.
@@ -907,12 +1043,33 @@ class ArmControlGUI(Node):
                 )
                 return
 
-            with self._camera_lock:
-                self.latest_camera_frame = frame
-                self._ros2_camera_active = True
-                self._ros2_camera_last_time = time.time()
+            self._store_latest_camera_frame(frame)
+            self._ros2_camera_active = True
         except Exception as e:
             self.get_logger().error(f'Camera frame decode error: {e}')
+
+    def _store_latest_camera_frame(self, frame):
+        """Publish one new source frame to the Tk display loop."""
+        with self._camera_lock:
+            self.latest_camera_frame = frame
+            self._camera_frame_count += 1
+            self._camera_frame_at = time.monotonic()
+
+    def _take_new_camera_frame(self):
+        """Return only a source frame that the Tk loop has not rendered yet."""
+        with self._camera_lock:
+            if self.latest_camera_frame is None:
+                return None, False
+            if time.monotonic() - self._camera_frame_at > self.CAMERA_STALE_S:
+                return None, False
+            if self._camera_frame_count == self._displayed_camera_frame_count:
+                return None, True
+            frame = self.latest_camera_frame
+            self._displayed_camera_frame_count = self._camera_frame_count
+
+        # Producers replace the array. Detection copies only when it needs
+        # an owned frame for inference or an in-place overlay.
+        return frame, True
 
     # ---- Direct camera fallback (like app.py) ----
     # Camera frame file written by host-side camera_stream.sh
@@ -1056,7 +1213,7 @@ class ArmControlGUI(Node):
         """Background thread: read the latest JPEG frame from the shared file."""
         last_mtime = 0.0
         while True:
-            if not self.camera_enabled.get() or self._ros2_camera_active:
+            if not self._camera_active.is_set() or self._ros2_camera_active:
                 time.sleep(0.5)
                 continue
             try:
@@ -1080,13 +1237,11 @@ class ArmControlGUI(Node):
                     )
                     if frame is not None:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        with self._camera_lock:
-                            self.latest_camera_frame = rgb
+                        self._store_latest_camera_frame(rgb)
                 else:
                     import io
                     pil_img = PILImage.open(io.BytesIO(jpeg_data))
-                    with self._camera_lock:
-                        self.latest_camera_frame = np.array(pil_img)
+                    self._store_latest_camera_frame(np.array(pil_img))
             except Exception:
                 time.sleep(0.1)
 
@@ -1094,7 +1249,7 @@ class ArmControlGUI(Node):
         """Background thread: read MJPEG frames from rpicam-vid pipe."""
         buf = b''
         while self._direct_cam_proc and self._direct_cam_proc.poll() is None:
-            if not self.camera_enabled.get() or self._ros2_camera_active:
+            if not self._camera_active.is_set() or self._ros2_camera_active:
                 time.sleep(0.5)
                 continue
             try:
@@ -1119,29 +1274,26 @@ class ArmControlGUI(Node):
                     )
                     if frame is not None:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        with self._camera_lock:
-                            self.latest_camera_frame = rgb
+                        self._store_latest_camera_frame(rgb)
                 else:
                     # Decode with PIL
                     import io
                     pil_img = PILImage.open(io.BytesIO(jpeg_data))
-                    with self._camera_lock:
-                        self.latest_camera_frame = np.array(pil_img)
+                    self._store_latest_camera_frame(np.array(pil_img))
             except Exception:
                 break
 
     def _direct_opencv_loop(self):
         """Background thread: read frames from OpenCV V4L2 device."""
         while self._direct_cam_cap and self._direct_cam_cap.isOpened():
-            if not self.camera_enabled.get() or self._ros2_camera_active:
+            if not self._camera_active.is_set() or self._ros2_camera_active:
                 time.sleep(0.5)
                 continue
             try:
                 ret, bgr = self._direct_cam_cap.read()
                 if ret and bgr is not None:
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    with self._camera_lock:
-                        self.latest_camera_frame = rgb
+                    self._store_latest_camera_frame(rgb)
             except Exception:
                 break
 
@@ -1150,17 +1302,43 @@ class ArmControlGUI(Node):
         """Kick off the periodic Tkinter camera frame update."""
         self._refresh_camera_frame()
 
+    def _is_target_drag_active(self):
+        """Return true while the orange Cartesian target is held by the mouse."""
+        visualization = getattr(self, 'viz_3d', None)
+        return bool(visualization and getattr(visualization, 'dragging', False))
+
+    def _camera_motion_mode_active(self):
+        """Keep vision processing live when it is actively controlling the arm."""
+        variables = (
+            getattr(self, 'follow_enabled', None),
+            getattr(self, 'handshake_enabled', None),
+            getattr(self, 'grab_enabled', None),
+            getattr(self, 'visual_servo_enabled', None),
+        )
+        return any(variable is not None and bool(variable.get()) for variable in variables)
+
+    def _prioritize_cartesian_animation(self):
+        """Favor Cartesian animation unless a vision mode actively needs frames."""
+        return (
+            self._is_target_drag_active()
+            and not self._camera_motion_mode_active()
+        )
+
     def _refresh_camera_frame(self):
         """Pull the latest frame and display it in the Tkinter Label."""
         if self.camera_label is None or not PIL_AVAILABLE:
             return
 
+        started = time.monotonic()
+        refresh_delay_ms = self.CAMERA_REFRESH_MS
         try:
             if self.camera_enabled.get():
-                frame = None
-                with self._camera_lock:
-                    if self.latest_camera_frame is not None:
-                        frame = self.latest_camera_frame.copy()
+                # Reserve time for the canvas during active mouse movement.
+                cartesian_throttled = self._prioritize_cartesian_animation()
+                if cartesian_throttled:
+                    refresh_delay_ms = self.CAMERA_DRAG_REFRESH_MS
+
+                frame, has_frame = self._take_new_camera_frame()
 
                 if frame is not None:
                     # Run object detection overlay (if enabled)
@@ -1183,7 +1361,7 @@ class ArmControlGUI(Node):
                                 face_cx = (face['x1'] + face['x2']) / 2.0
                                 offset_x = (face_cx - w / 2.0) / (w / 2.0)  # -1..+1
                                 base_now = float(self.joint_sliders[0].get())
-                                self._handshake_base = max(0, min(270, base_now - offset_x * 12.0))
+                                self._handshake_base = max(0, min(245, base_now - offset_x * 12.0))
                                 self._start_handshake()
                                 self._handshake_detect_count = 0
                         else:
@@ -1213,28 +1391,26 @@ class ArmControlGUI(Node):
                     # Frames are typically already 640x480 — skip
                     # expensive PIL resize when no scaling is needed.
                     h, w = frame.shape[:2]
-                    if w > 640 or h > 480:
-                        # Need to downscale — use cv2 (C-native, ~10x faster
-                        # than PIL LANCZOS) when available.
-                        if CV2_AVAILABLE:
-                            scale = min(640 / w, 480 / h)
-                            frame = cv2.resize(
-                                frame,
-                                (int(w * scale), int(h * scale)),
-                                interpolation=cv2.INTER_LINEAR,
-                            )
-                        else:
-                            pil_img = PILImage.fromarray(frame)
-                            pil_img.thumbnail((640, 480), PILImage.BILINEAR)
-                            self.camera_photo = ImageTk.PhotoImage(image=pil_img)
-                            self.camera_label.configure(image=self.camera_photo, text='')
-                            # (skip redundant conversion below)
-                            frame = None
+                    if (w > 640 or h > 480) and CV2_AVAILABLE:
+                        scale = min(640 / w, 480 / h)
+                        frame = cv2.resize(
+                            frame, (max(1, int(w * scale)), max(1, int(h * scale))),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    pil_img = PILImage.fromarray(frame)
+                    if not CV2_AVAILABLE:
+                        pil_img.thumbnail((640, 480), PILImage.BILINEAR)
 
-                    if frame is not None:
-                        pil_img = PILImage.fromarray(frame)
+                    photo = self.camera_photo
+                    if (
+                        photo is None or self._camera_placeholder_text is not None
+                        or (photo.width(), photo.height()) != pil_img.size
+                    ):
                         self.camera_photo = ImageTk.PhotoImage(image=pil_img)
                         self.camera_label.configure(image=self.camera_photo, text='')
+                    else:
+                        photo.paste(pil_img)
+                    self._camera_placeholder_text = None
 
                     # FPS counter
                     self._cam_fps_count += 1
@@ -1254,27 +1430,42 @@ class ArmControlGUI(Node):
                         src = f"Direct ({self._direct_cam_backend})"
                     else:
                         src = "Unknown"
-                    if self.camera_status_label:
-                        self.camera_status_label.config(
-                            text=f"● {src}", fg='#00ff00'
-                        )
-                else:
-                    # No frame yet
-                    self._show_camera_placeholder("Waiting for camera...")
+                    mode = " · Drag (10 FPS cap)" if cartesian_throttled else ""
+                    self._set_camera_status(f"● {src}{mode}", '#00ff00')
+                elif not has_frame:
+                    self._show_camera_placeholder("Waiting for fresh camera frames...")
+                    changed = self._set_camera_status("Waiting for frames", '#ffaa00')
+                    if changed and self.camera_fps_label:
+                        self.camera_fps_label.config(text="FPS: --")
+                    self._cam_fps_count = 0
+                    self._cam_fps_time = time.time()
+                    refresh_delay_ms = 100
             else:
                 self._show_camera_placeholder("Camera disabled")
-                if self.camera_status_label:
-                    self.camera_status_label.config(text="⏸ Disabled", fg='#888888')
+                self._set_camera_status("⏸ Disabled", '#888888')
+                refresh_delay_ms = 250
         except Exception as e:
             self.get_logger().error(f'Camera display error: {e}')
 
-        # Schedule next refresh (~30 FPS for the display)
-        self.root.after(16, self._refresh_camera_frame)
+        # Poll at display rate only while frames can change. Disabled/static
+        # camera states are deliberately much slower and allocate nothing.
+        remaining_ms = max(1, refresh_delay_ms - int((time.monotonic() - started) * 1000))
+        self._camera_after_id = self.root.after(remaining_ms, self._refresh_camera_frame)
+
+    def _set_camera_status(self, text, color):
+        status = (text, color)
+        if self.camera_status_label and status != self._camera_status:
+            self.camera_status_label.config(text=text, fg=color)
+            self._camera_status = status
+            return True
+        return False
 
     def _show_camera_placeholder(self, text="No Camera Feed"):
         """Show a dark placeholder image with text."""
         if self.camera_label is None or not PIL_AVAILABLE:
-            return
+            return False
+        if self._camera_placeholder_text == text:
+            return False
         try:
             img = PILImage.new('RGB', (640, 480), color=(26, 26, 26))
             draw = ImageDraw.Draw(img)
@@ -1289,17 +1480,29 @@ class ArmControlGUI(Node):
                       fill=(100, 100, 100), font=font)
             self.camera_photo = ImageTk.PhotoImage(image=img)
             self.camera_label.configure(image=self.camera_photo, text='')
+            self._camera_placeholder_text = text
+            return True
         except Exception:
             self.camera_label.configure(image='', text=text)
+            self._camera_placeholder_text = text
+            return True
 
     def _on_camera_toggle(self):
         """Handle camera enable/disable toggle."""
         if self.camera_enabled.get():
+            self._camera_active.set()
+            with self._camera_lock:
+                self._displayed_camera_frame_count = -1
             self.get_logger().info('[CAM-GUI] Camera enabled')
             # If no backend was found, retry
-            if not self._ros2_camera_active and not self._direct_cam_backend:
+            if (not self.camera_preview and not self._ros2_camera_active
+                    and not self._direct_cam_backend):
                 threading.Thread(target=self._init_direct_camera, daemon=True).start()
         else:
+            self._camera_active.clear()
+            with self._camera_lock:
+                self._pending_preview = None
+                self.latest_camera_frame = None
             self.get_logger().info('[CAM-GUI] Camera disabled')
 
     def _on_detect_toggle(self):
@@ -1412,7 +1615,7 @@ class ArmControlGUI(Node):
 
         # Horizontal: base
         if eff_x != 0.0:
-            new_base = max(0, min(270, self.target_positions[0] - pan_delta))
+            new_base = max(0, min(245, self.target_positions[0] - pan_delta))
             self.joint_sliders[0].set(new_base)
             self.target_positions[0] = new_base
             moved = True
@@ -1513,6 +1716,16 @@ class ArmControlGUI(Node):
         """Handle the 🤝 Handshake checkbox toggle."""
         on = self.handshake_enabled.get()
         if on:
+            if not self.gripper_calibrated:
+                self.handshake_enabled.set(False)
+                self.info_label.config(
+                    text="Handshake disabled: calibrate the gripper close endpoint first",
+                    fg='#ff4444',
+                )
+                self.get_logger().error(
+                    '[HANDSHAKE] Refused: gripper close endpoint is not calibrated'
+                )
+                return
             # Auto-enable camera and detection
             if not self.camera_enabled.get():
                 self.camera_enabled.set(True)
@@ -1553,8 +1766,8 @@ class ArmControlGUI(Node):
         neutral position for all handshake motions.  Each step only changes
         the joints listed in *delta_dict* relative to that lean pose.
         """
-        # Joint limits: base 0-270, others 0-180
-        limits = [270.0, 180.0, 180.0, 180.0, 180.0, 180.0]
+        # Joint limits: base 0-245, others 0-180
+        limits = [245.0, 180.0, 180.0, 180.0, 180.0, 180.0]
         target = list(self._handshake_lean_pose)
         for idx, delta in delta_dict.items():
             target[idx] = max(0.0, min(limits[idx], target[idx] + delta))
@@ -1599,7 +1812,7 @@ class ArmControlGUI(Node):
 
         # Step 1: Close the gripper first (from current position, only change gripper)
         grip_pose = list(self._handshake_home_pose)
-        grip_pose[5] = min(180.0, grip_pose[5] + 40.0)  # close gripper
+        grip_pose[5] = self.gripper_closed_degrees
         self._handshake_lean_pose[5] = grip_pose[5]      # remember closed grip for lean pose
 
         self._handshake_interpolate(
@@ -1789,8 +2002,6 @@ class ArmControlGUI(Node):
     _GRAB_LOST_LIMIT     = 30      # ticks (~3 s) without detection before abort
 
     # Phase-2 reach
-    _GRAB_GRIPPER_OPEN   = 30.0
-    _GRAB_GRIPPER_CLOSE  = 140.0
     _GRAB_HOLD_MS        = 2000    # ms to hold gripper closed
     _GRAB_INTERP_STEPS   = 40      # joint-space interpolation steps
     _GRAB_INTERP_MS      = 20      # ms per interpolation step
@@ -1810,6 +2021,16 @@ class ArmControlGUI(Node):
         """Handle the 🎯 Grab checkbox toggle."""
         on = self.grab_enabled.get()
         if on:
+            if not self.gripper_calibrated:
+                self.grab_enabled.set(False)
+                self.info_label.config(
+                    text="Grab disabled: calibrate the gripper close endpoint first",
+                    fg='#ff4444',
+                )
+                self.get_logger().error(
+                    '[GRAB] Refused: gripper close endpoint is not calibrated'
+                )
+                return
             # Auto-enable camera & detection in red mode
             if not self.camera_enabled.get():
                 self.camera_enabled.set(True)
@@ -1887,8 +2108,8 @@ class ArmControlGUI(Node):
         self._grab_center_ticks = 0
 
         # Open gripper
-        self.joint_sliders[5].set(self._GRAB_GRIPPER_OPEN)
-        self.target_positions[5] = self._GRAB_GRIPPER_OPEN
+        self.joint_sliders[5].set(self.gripper_open_degrees)
+        self.target_positions[5] = self.gripper_open_degrees
         self.send_command()
 
         self.root.after(self._GRAB_SERVO_MS, self._grab_center_tick)
@@ -1936,7 +2157,7 @@ class ArmControlGUI(Node):
             # Face-follow convention: object right → decrease base
             if off_x:
                 eff = math.copysign(abs(err_x) - DZ, err_x)
-                new_base = max(0, min(270,
+                new_base = max(0, min(245,
                     self.target_positions[0] - eff * self._GRAB_PAN_GAIN))
                 self.joint_sliders[0].set(new_base)
                 self.target_positions[0] = new_base
@@ -1995,10 +2216,9 @@ class ArmControlGUI(Node):
         forearm  = self.target_positions[3]
         wrist    = self.target_positions[4]
 
-        base_rad     = math.radians(base - 90.0)
-        shoulder_rad = math.radians(90.0 - shoulder)
-        elbow_rad    = math.radians(90.0 - elbow)
-        forearm_rad  = math.radians(90.0 - forearm)
+        base_rad, shoulder_rad, elbow_rad, forearm_rad = (
+            servo_degrees_to_radians(self.target_positions)[:4]
+        )
 
         # Cumulative pitch from vertical (FK convention)
         pitch = shoulder_rad + elbow_rad + forearm_rad
@@ -2065,8 +2285,12 @@ class ArmControlGUI(Node):
             try_z = max(0.02, self._GRAB_L_BASE + try_dz)
             try_x = try_r * math.cos(target_base_rad)
             try_y = try_r * math.sin(target_base_rad)
-            ik = self.solve_ik_to_point(try_x, try_y, try_z,
-                                         gripper_angle=self._GRAB_GRIPPER_OPEN)
+            ik = self.solve_ik_to_point(
+                try_x,
+                try_y,
+                try_z,
+                gripper_angle=self.gripper_open_degrees,
+            )
             if ik:
                 if pct < 1.0:
                     self.get_logger().info(
@@ -2105,8 +2329,14 @@ class ArmControlGUI(Node):
             self._grab_phase = 'idle'
             return
 
-        target_angles = [ik['base'], ik['shoulder'], ik['elbow'],
-                         ik['forearm'], ik['wrist'], self._GRAB_GRIPPER_OPEN]
+        target_angles = [
+            ik['base'],
+            ik['shoulder'],
+            ik['elbow'],
+            ik['forearm'],
+            ik['wrist'],
+            self.gripper_open_degrees,
+        ]
 
         self.info_label.config(
             text="\U0001F3AF Reaching toward object...", fg='#ff5555')
@@ -2122,8 +2352,8 @@ class ArmControlGUI(Node):
             return
 
         self._grab_phase = 'grabbing'
-        self.joint_sliders[5].set(self._GRAB_GRIPPER_CLOSE)
-        self.target_positions[5] = self._GRAB_GRIPPER_CLOSE
+        self.joint_sliders[5].set(self.gripper_closed_degrees)
+        self.target_positions[5] = self.gripper_closed_degrees
         self.send_command()
         self.info_label.config(text="\U0001F3AF Gripping!", fg='#32ff7e')
         self.get_logger().info('[GRAB] Gripper CLOSED — holding 2 s')
@@ -2136,8 +2366,8 @@ class ArmControlGUI(Node):
             self._grab_finish_cancel()
             return
 
-        self.joint_sliders[5].set(self._GRAB_GRIPPER_OPEN)
-        self.target_positions[5] = self._GRAB_GRIPPER_OPEN
+        self.joint_sliders[5].set(self.gripper_open_degrees)
+        self.target_positions[5] = self.gripper_open_degrees
         self.send_command()
         self.get_logger().info('[GRAB] Gripper RELEASED — done')
         self.info_label.config(
@@ -2241,15 +2471,9 @@ class ArmControlGUI(Node):
 
         All vectors are expressed in the **base frame**.
         """
-        base = self.target_positions[0]
-        shoulder = self.target_positions[1]
-        elbow = self.target_positions[2]
-        forearm = self.target_positions[3]
-
-        base_rad = math.radians(base - 90.0)
-        shoulder_rad = math.radians(90.0 - shoulder)
-        elbow_rad = math.radians(90.0 - elbow)
-        forearm_rad = math.radians(90.0 - forearm)   # INVERTED (matches FK)
+        base_rad, shoulder_rad, elbow_rad, forearm_rad = (
+            servo_degrees_to_radians(self.target_positions)[:4]
+        )
 
         # Cumulative pitch angle of the gripper (from vertical)
         pitch = shoulder_rad + elbow_rad + forearm_rad
@@ -2346,15 +2570,7 @@ class ArmControlGUI(Node):
         new_z = max(0.0, min(0.45, new_z))
 
         # Try IK at the proposed target
-        trial_ik = self.custom_ik_solver.solve_ik_to_point(
-            new_x, new_y, new_z, roll=0, seed_state={
-                'base': self.target_positions[0],
-                'shoulder': self.target_positions[1],
-                'elbow': self.target_positions[2],
-                'forearm': self.target_positions[3],
-                'wrist': self.target_positions[4],
-            }
-        )
+        trial_ik = self.solve_ik_to_point(new_x, new_y, new_z)
 
         if trial_ik is None:
             # Unreachable — roll back, don't drift outward
@@ -2391,7 +2607,7 @@ class ArmControlGUI(Node):
             messagebox.showwarning("Snapshot", "No camera frame available.")
             return
         self._camera_snapshot_count += 1
-        filename = f'/tmp/jarvis_snapshot_{self._camera_snapshot_count:04d}.png'
+        filename = f'/tmp/rashko_snapshot_{self._camera_snapshot_count:04d}.png'
         try:
             pil_img = PILImage.fromarray(frame)
             pil_img.save(filename)
@@ -2433,18 +2649,137 @@ class ArmControlGUI(Node):
     
     def on_slider_change(self, joint_idx, value):
         """Handle slider value change"""
-        self.target_positions[joint_idx] = float(value)
-        self.joint_labels[joint_idx].config(text=f"{float(value):.1f}°")
+        rendered_value = float(value)
+        self.target_positions[joint_idx] = rendered_value
+        self._rendered_joint_positions[joint_idx] = rendered_value
+        self.joint_labels[joint_idx].config(text=f"{rendered_value:.1f}°")
+
+        # With no simulation or hardware backend there is no /joint_states
+        # feedback to animate the canvas.  Keep that mode useful by showing a
+        # local command preview, without ever publishing desired angles as
+        # measured state.  Once feedback has arrived, the canvas remains
+        # feedback-driven instead.
+        self._preview_targets_without_feedback()
         
         # Auto-send if real-time mode is enabled
         if self.realtime_mode.get():
             self.schedule_update()
+
+    def _cancel_pending_motion(self):
+        """Invalidate queued GUI motion without sending any robot command."""
+        self._drag_ik_generation += 1
+        self._drag_ik_latest_request = None
+        for attribute in (
+            '_update_after_id',
+            '_cartesian_update_after_id',
+            '_interpolation_after_id',
+        ):
+            after_id = getattr(self, attribute, None)
+            if after_id is not None:
+                self.root.after_cancel(after_id)
+                setattr(self, attribute, None)
+        self.update_pending = False
+        self.cartesian_update_pending = False
+
+    def _take_manual_control(self, event=None):
+        """A manual joint edit or preset supersedes all pending Cartesian work."""
+        if self.auto_follow_active.get():
+            self.toggle_auto_follow()
+        elif (event is None or self._drag_ik_latest_request is not None
+              or self.cartesian_update_pending
+              or self._interpolation_after_id is not None):
+            self._cancel_pending_motion()
+        # A FocusOut event may arrive AFTER a joint click/Home takeover. Drop
+        # uncommitted XYZ text so that event cannot queue a fresh, conflicting
+        # IK move. Already accepted Cartesian values/target remain unchanged.
+        for axis, entry in self.cartesian_entries.items():
+            accepted = self._cartesian_entry_text[axis]
+            if entry.get() != accepted:
+                entry.delete(0, tk.END)
+                entry.insert(0, accepted)
+
+    def _on_realtime_toggle(self):
+        """Disabling auto-update also revokes its already queued commands."""
+        if not self.realtime_mode.get():
+            self._cancel_pending_motion()
+
+    def send_manual_command(self):
+        """Send button: cancel old IK before publishing the selected joint pose."""
+        self._take_manual_control()
+        self.send_command()
+
+    def _set_joint_controls(self, angles, preview=True, update_widgets=True):
+        """Update joint state, optionally deferring expensive widget repainting."""
+        changed = False
+        rendered_positions = getattr(
+            self,
+            '_rendered_joint_positions',
+            list(self.target_positions),
+        )
+        self._rendered_joint_positions = rendered_positions
+        for index, angle in enumerate(angles):
+            if angle is None:
+                continue
+            value = float(angle)
+            if value != self.target_positions[index]:
+                changed = True
+            self.target_positions[index] = value
+            if update_widgets and value != rendered_positions[index]:
+                # Updating the Scale's variable changes its displayed position
+                # but does not invoke the callback reserved for user drags.
+                self.joint_values[index].set(value)
+                self.joint_labels[index].config(text=f"{value:.1f}°")
+                rendered_positions[index] = value
+
+        if preview and changed:
+            self._preview_targets_without_feedback()
+        return changed
+
+    def _set_cartesian_controls(self, x_mm, y_mm, z_mm, update_widgets=True):
+        """Update XYZ state while allowing drag-time widget repaint deferral."""
+        coordinates = {'X': float(x_mm), 'Y': float(y_mm), 'Z': float(z_mm)}
+        if update_widgets:
+            if not hasattr(self, '_cartesian_entry_text'):
+                self._cartesian_entry_text = {}
+            for axis, value in coordinates.items():
+                self.cartesian_values[axis].set(value)
+                self.cartesian_entries[axis].delete(0, tk.END)
+                text = str(int(value))
+                self.cartesian_entries[axis].insert(0, text)
+                self._cartesian_entry_text[axis] = text
+                self.cartesian_labels[axis].config(text=f"{int(value)} mm")
+
+        if self.viz_3d:
+            self.viz_3d.set_target(
+                coordinates['X'] / 1000.0,
+                coordinates['Y'] / 1000.0,
+                coordinates['Z'] / 1000.0,
+            )
+
+    def _preview_targets_without_feedback(self):
+        """Render desired joints locally only until real joint feedback exists."""
+        if self.viz_3d is None or ArmControlGUI._has_joint_feedback(self):
+            return False
+        self.viz_3d.set_joint_angles(self.target_positions)
+        return True
+
+    def _has_joint_feedback(self):
+        """Return true as soon as ROS feedback reaches either GUI thread."""
+        return bool(getattr(self, '_feedback_initialized', False)) or (
+            getattr(self, '_pending_initial_feedback', None) is not None
+        )
     
     def on_cartesian_slider_change(self, axis, value):
         """Handle cartesian slider change"""
+        # XYZ edits replace an in-flight mouse target even with Real-time OFF.
+        # Programmatic target display updates use variables, not this callback.
+        if not self.cartesian_update_pending:
+            self._cancel_pending_motion()
         # Update entry and label
+        text = str(int(float(value)))
         self.cartesian_entries[axis].delete(0, tk.END)
-        self.cartesian_entries[axis].insert(0, str(int(float(value))))
+        self.cartesian_entries[axis].insert(0, text)
+        self._cartesian_entry_text[axis] = text
         self.cartesian_labels[axis].config(text=f"{int(float(value))} mm")
         
         # Sync with 3D visualization
@@ -2461,69 +2796,20 @@ class ArmControlGUI(Node):
     def on_cartesian_entry_change(self, axis):
         """Handle cartesian entry change"""
         try:
-            value = float(self.cartesian_entries[axis].get())
-            # Update slider and label
-            self.cartesian_sliders[axis].set(value)
-            self.cartesian_labels[axis].config(text=f"{int(value)} mm")
-            
-            # Sync with 3D visualization
-            if self.viz_3d:
-                x_mm = float(self.cartesian_entries['X'].get())
-                y_mm = float(self.cartesian_entries['Y'].get())
-                z_mm = float(self.cartesian_entries['Z'].get())
-                self.viz_3d.set_target(x_mm / 1000.0, y_mm / 1000.0, z_mm / 1000.0)
-            
-            # Solve IK if real-time mode enabled
-            if self.realtime_mode.get():
-                self.schedule_cartesian_update()
+            text = self.cartesian_entries[axis].get()
+            if text == self._cartesian_entry_text[axis]:
+                return  # Mere focus changes are not new Cartesian commands.
+            value = float(text)
+            if not math.isfinite(value):
+                return
+            # Variable.set does not schedule a second Scale command callback.
+            self.cartesian_values[axis].set(value)
+            self.on_cartesian_slider_change(axis, self.cartesian_values[axis].get())
         except ValueError:
             pass  # Ignore invalid input
-    
-    def solve_ik(self, x, y, z, pitch=0.0, roll=0.0, gripper_angle=None):
-        """
-        Solve inverse kinematics using MoveIt (preferred) or custom solver (fallback).
-        
-        Args:
-            x, y, z: Target position in meters
-            pitch, roll: End effector orientation in radians
-            gripper_angle: Gripper opening angle in degrees
-            
-        Returns:
-            Dict of joint angles in degrees, or None if IK fails
-        """
-        joint_angles = None
-        
-        # Build current seed state from GUI positions
-        seed_state = {
-            'base': self.target_positions[0],
-            'shoulder': self.target_positions[1],
-            'elbow': self.target_positions[2],
-            'wrist': self.target_positions[3],
-            'wrist_rotate': self.target_positions[4],
-        }
-        
-        # Try MoveIt first if available
-        if self.use_moveit and self.moveit_ik and self.moveit_ik.is_available():
-            self.get_logger().debug("Using MoveIt IK solver...")
-            joint_angles = self.moveit_ik.solve_ik(x, y, z, pitch, roll, gripper_angle, seed_state)
-            if joint_angles:
-                self.info_label.config(text="[MoveIt IK] ", fg='#00ff88')
-        
-        # Fall back to custom solver
-        if joint_angles is None:
-            self.get_logger().debug("Using custom geometric IK solver...")
-            joint_angles = self.custom_ik_solver.solve_ik(x, y, z, pitch, roll, gripper_angle, seed_state)
-            if joint_angles:
-                self.get_logger().info("Using custom geometric IK (MoveIt unavailable)")
-        
-        return joint_angles
-    
-    def solve_ik_to_point(self, x, y, z, gripper_angle=None):
-        """Solve IK so the gripper tip lands on (x, y, z).
 
-        Automatically searches for the best pitch angle.
-        Falls back to the old pitch-guess method if the search fails.
-        """
+    def solve_ik(self, x, y, z, pitch=0.0, roll=0.0, gripper_angle=None):
+        """Solve with the original geometric Cartesian model."""
         seed_state = {
             'base': self.target_positions[0],
             'shoulder': self.target_positions[1],
@@ -2531,31 +2817,169 @@ class ArmControlGUI(Node):
             'forearm': self.target_positions[3],
             'wrist': self.target_positions[4],
         }
-        result = self.custom_ik_solver.solve_ik_to_point(
-            x, y, z, roll=0, gripper_angle=gripper_angle, seed_state=seed_state
+        with self._ik_solver_lock:
+            return self.custom_ik_solver.solve_ik(
+                x,
+                y,
+                z,
+                pitch,
+                roll,
+                gripper_angle,
+                seed_state,
+            )
+    
+    def solve_ik_to_point(self, x, y, z, gripper_angle=None):
+        """Solve XYZ with the original free-pitch geometric point solver."""
+        seed_state = {
+            'base': self.target_positions[0],
+            'shoulder': self.target_positions[1],
+            'elbow': self.target_positions[2],
+            'forearm': self.target_positions[3],
+            'wrist': self.target_positions[4],
+        }
+        return self._solve_ik_to_point_with_seed(
+            x,
+            y,
+            z,
+            gripper_angle,
+            seed_state,
         )
-        return result
+
+    def _solve_ik_to_point_with_seed(
+        self, x, y, z, gripper_angle, seed_state
+    ):
+        """Call the unchanged point solver under its cross-thread lock."""
+        with self._ik_solver_lock:
+            return self.custom_ik_solver.solve_ik_to_point(
+                x,
+                y,
+                z,
+                roll=0.0,
+                gripper_angle=gripper_angle,
+                seed_state=seed_state,
+            )
 
     def forward_kinematics(self, base, shoulder, elbow, forearm, wrist):
-        """
-        Calculate end effector position using MoveIt (TF) or custom FK.
-        
-        Args:
-            Joint angles in degrees (GUI convention: 90° = home)
-            
-        Returns:
-            Tuple of (x, y, z, pitch, roll)
-        """
-        # Try MoveIt/TF first if available
-        if self.use_moveit and self.moveit_ik:
-            return self.moveit_ik.forward_kinematics(base, shoulder, elbow, forearm, wrist)
-        
-        # Fall back to custom solver
+        """Calculate XYZ with the same geometry used by mouse IK and canvas."""
         return self.custom_ik_solver.forward_kinematics(base, shoulder, elbow, forearm, wrist)
+
+    def _drag_widgets_due(self):
+        """Limit secondary Scale/Entry repainting while preserving arm frames."""
+        now = time.monotonic()
+        if now - self._drag_widget_last_refresh < self.DRAG_WIDGET_REFRESH_S:
+            return False
+        self._drag_widget_last_refresh = now
+        return True
+
+    def _queue_drag_ik(self, x, y, z, update_widgets):
+        """Keep one active solve and at most one latest mouse target."""
+        self._drag_ik_sequence += 1
+        request = {
+            'sequence': self._drag_ik_sequence,
+            'generation': self._drag_ik_generation,
+            'target': (float(x), float(y), float(z)),
+            'update_widgets': bool(update_widgets),
+        }
+        self._drag_ik_latest_request = request
+        if not self._drag_ik_running:
+            self._start_drag_ik_request(request)
+        self._schedule_drag_ik_poll()
+
+    def _start_drag_ik_request(self, request):
+        """Snapshot the current arm state and start one daemon IK worker."""
+        seed_values = tuple(self.target_positions[:5])
+        request = dict(request)
+        request['seed_state'] = dict(zip(
+            ('base', 'shoulder', 'elbow', 'forearm', 'wrist'),
+            seed_values,
+        ))
+        request['gripper_angle'] = float(self.target_positions[5])
+        self._drag_ik_running = True
+        threading.Thread(
+            target=self._drag_ik_worker,
+            args=(request,),
+            name='arm-gui-drag-ik',
+            daemon=True,
+        ).start()
+
+    def _drag_ik_worker(self, request):
+        """Solve one target without calling Tk or ROS from this worker."""
+        error = None
+        solution = None
+        try:
+            x, y, z = request['target']
+            solution = self._solve_ik_to_point_with_seed(
+                x,
+                y,
+                z,
+                request['gripper_angle'],
+                request['seed_state'],
+            )
+        except Exception as exc:  # delivered to the Tk thread for ROS logging
+            error = exc
+        self._drag_ik_result_queue.put((request, solution, error))
+
+    def _schedule_drag_ik_poll(self):
+        if self._drag_ik_poll_after_id is None:
+            self._drag_ik_poll_after_id = self.root.after(
+                self.DRAG_IK_POLL_MS,
+                self._poll_drag_ik,
+            )
+
+    def _poll_drag_ik(self):
+        """Apply completed IK on Tk, then immediately solve the latest target."""
+        self._drag_ik_poll_after_id = None
+        try:
+            request, solution, error = self._drag_ik_result_queue.get_nowait()
+        except queue.Empty:
+            if self._drag_ik_running and not self._gui_shutdown.is_set():
+                self._schedule_drag_ik_poll()
+            return
+
+        self._drag_ik_running = False
+        latest = self._drag_ik_latest_request
+        request_is_latest = bool(
+            latest and latest['sequence'] == request['sequence']
+        )
+        request_is_current = (
+            request['generation'] == self._drag_ik_generation
+            and self.auto_follow_active.get()
+            and not self._gui_shutdown.is_set()
+        )
+
+        if request_is_current and error is not None:
+            self.get_logger().error(f'Drag IK worker failed: {error}')
+        elif request_is_current and request_is_latest:
+            # Never command an obsolete mouse position. The next block starts
+            # one solve for the newest target using the current command seed.
+            x, y, z = request['target']
+            self._apply_3d_target_solution(
+                x,
+                y,
+                z,
+                solution,
+                update_widgets=request['update_widgets'],
+                show_status=True,
+            )
+
+        latest = self._drag_ik_latest_request
+        if (
+            latest
+            and latest['generation'] == self._drag_ik_generation
+            and latest['sequence'] > request['sequence']
+            and self.auto_follow_active.get()
+            and not self._gui_shutdown.is_set()
+        ):
+            # Capture a fresh seed from the most recently commanded state.
+            self._start_drag_ik_request(latest)
+            self._schedule_drag_ik_poll()
+        elif request_is_latest:
+            self._drag_ik_latest_request = None
     
     def toggle_auto_follow(self):
         """Toggle the Start/Stop auto-follow mode for cartesian tracking."""
         active = not self.auto_follow_active.get()
+        self._cancel_pending_motion()
         self.auto_follow_active.set(active)
         
         if active:
@@ -2589,43 +3013,6 @@ class ArmControlGUI(Node):
             )
             self.get_logger().info('Auto-follow mode STOPPED')
 
-    # Maximum allowed per-joint change (degrees) in a single cartesian/IK step.
-    # If ANY motor would jump more than this, the pose is rejected to protect
-    # the hardware from sudden, potentially damaging movements.
-    MAX_JOINT_DELTA_DEG = 35.0
-
-    def _check_joint_delta_safe(self, target_angles, label="IK"):
-        """Return True if every joint's change is within MAX_JOINT_DELTA_DEG.
-
-        Args:
-            target_angles: list of 6 target angles (degrees, 0-180)
-            label: short tag for log messages
-
-        Returns:
-            True  – move is safe to execute
-            False – at least one joint exceeds the threshold
-        """
-        for i, target in enumerate(target_angles):
-            # Skip gripper (index 5) — it is independent of arm position
-            # and should never block a cartesian/IK move.
-            if i == 5:
-                continue
-            current = float(self.joint_sliders[i].get())
-            delta = abs(target - current)
-            if delta > self.MAX_JOINT_DELTA_DEG:
-                self.get_logger().warn(
-                    f'[{label}] Joint {i+1} delta {delta:.1f}° exceeds '
-                    f'{self.MAX_JOINT_DELTA_DEG}° limit (cur={current:.1f}° → '
-                    f'tgt={target:.1f}°). Move BLOCKED.'
-                )
-                self.info_label.config(
-                    text=f"⛔ Blocked: Joint {i+1} would jump {delta:.0f}° "
-                         f"(max {self.MAX_JOINT_DELTA_DEG:.0f}°)",
-                    fg='#ff4444'
-                )
-                return False
-        return True
-
     def on_3d_target_move(self, x, y, z):
         """
         Callback when target is dragged in 3D visualization (auto-follow mode)
@@ -2636,38 +3023,68 @@ class ArmControlGUI(Node):
         Args:
             x, y, z: Target position in meters
         """
-        # Convert to millimeters for the UI
+        # A new mouse target supersedes delayed slider IK or interpolation.
+        if (self.update_pending or self.cartesian_update_pending
+                or self._interpolation_after_id is not None):
+            self._cancel_pending_motion()
         x_mm = x * 1000
         y_mm = y * 1000
         z_mm = z * 1000
-        
-        # Update cartesian sliders and entries
-        self.cartesian_sliders['X'].set(x_mm)
-        self.cartesian_sliders['Y'].set(y_mm)
-        self.cartesian_sliders['Z'].set(z_mm)
-        
-        self.cartesian_entries['X'].delete(0, tk.END)
-        self.cartesian_entries['X'].insert(0, str(int(x_mm)))
-        self.cartesian_entries['Y'].delete(0, tk.END)
-        self.cartesian_entries['Y'].insert(0, str(int(y_mm)))
-        self.cartesian_entries['Z'].delete(0, tk.END)
-        self.cartesian_entries['Z'].insert(0, str(int(z_mm)))
-        
-        self.cartesian_labels['X'].config(text=f"{int(x_mm)} mm")
-        self.cartesian_labels['Y'].config(text=f"{int(y_mm)} mm")
-        self.cartesian_labels['Z'].config(text=f"{int(z_mm)} mm")
-        
-        # Solve IK — automatically finds the best pitch so the gripper
-        # tip lands exactly on the target point
-        joint_angles = self.solve_ik_to_point(x, y, z)
-        
-        if joint_angles is None:
-            self.info_label.config(
-                text=f"⚠ Position ({int(x_mm)}, {int(y_mm)}, {int(z_mm)}) mm is unreachable",
-                fg='#ff8800'
-            )
+
+        dragging = self._is_target_drag_active()
+        update_widgets = not dragging or self._drag_widgets_due()
+
+        # This is one logical target update.  Do not invoke three Cartesian
+        # slider callbacks. During a drag, repaint these secondary widgets at
+        # 10 Hz; the orange target itself retains the full canvas frame rate.
+        self._set_cartesian_controls(
+            x_mm,
+            y_mm,
+            z_mm,
+            update_widgets=update_widgets,
+        )
+
+        if self.auto_follow_active.get():
+            self._queue_drag_ik(x, y, z, update_widgets)
             return
-        
+
+        # The original point solver searches pitch freely for broad reach.
+        joint_angles = self.solve_ik_to_point(x, y, z)
+
+        self._apply_3d_target_solution(
+            x,
+            y,
+            z,
+            joint_angles,
+            update_widgets=True,
+            show_status=True,
+        )
+
+    def _apply_3d_target_solution(
+        self,
+        x,
+        y,
+        z,
+        joint_angles,
+        update_widgets=True,
+        show_status=True,
+    ):
+        """Apply one unchanged IK result on Tk's thread and publish its command."""
+        x_mm = x * 1000
+        y_mm = y * 1000
+        z_mm = z * 1000
+
+        if joint_angles is None:
+            if show_status:
+                self.info_label.config(
+                    text=(
+                        f"⚠ Position ({int(x_mm)}, {int(y_mm)}, "
+                        f"{int(z_mm)}) mm is unreachable"
+                    ),
+                    fg='#ff8800'
+                )
+            return
+
         # Map IK solver's joint names to our joint order
         ik_to_gui_mapping = {
             'base': 0,
@@ -2681,45 +3098,35 @@ class ArmControlGUI(Node):
         target_angles = [0.0] * 6
         for ik_joint, gui_idx in ik_to_gui_mapping.items():
             angle = joint_angles[ik_joint]
-            hi = 270 if gui_idx == 0 else 180
+            hi = 245 if gui_idx == 0 else 180
             angle = max(0, min(hi, angle))
             target_angles[gui_idx] = angle
 
-        # Keep whatever gripper angle the user has set — IK only
-        # controls the arm joints, not the gripper.
-        target_angles[5] = float(self.joint_sliders[5].get())
-
-        # --- Safety: reject if any joint would jump too far ---
-        if not self._check_joint_delta_safe(target_angles, label='3D-IK'):
-            return
+        # Keep whatever gripper angle the user has set. It is already mirrored
+        # in target_positions, so no Tk widget read is needed in this hot path.
+        target_angles[5] = float(self.target_positions[5])
 
         # Publish target marker for RViz
         self.publish_target_marker(x, y, z)
         
-        # In auto-follow mode: direct move (no interpolation) for real-time response
+        # Auto-follow sends the latest bounded target; the Pi controller applies
+        # the configured servo-speed rate limit before changing PWM outputs.
         if self.auto_follow_active.get():
-            for i, angle in enumerate(target_angles):
-                self.joint_sliders[i].set(angle)
-                self.target_positions[i] = angle
-            
-            # Update 3D visualization
-            if self.viz_3d:
-                joint_angles_dict = {
-                    'base': target_angles[0],
-                    'shoulder': target_angles[1],
-                    'elbow': target_angles[2],
-                    'forearm': target_angles[3],
-                    'wrist': target_angles[4],
-                    'gripper': target_angles[5]
-                }
-                self.viz_3d.update_from_ik_solution(joint_angles_dict)
+            self._set_joint_controls(
+                target_angles,
+                update_widgets=update_widgets,
+            )
             
             # Send immediately
-            self.send_command()
-            self.info_label.config(
-                text=f"⚡ Tracking ({int(x_mm)}, {int(y_mm)}, {int(z_mm)}) mm",
-                fg='#ffaa00'
-            )
+            self.send_command(update_status=False)
+            if show_status and update_widgets:
+                self.info_label.config(
+                    text=(
+                        f"⚡ Tracking ({int(x_mm)}, {int(y_mm)}, "
+                        f"{int(z_mm)}) mm"
+                    ),
+                    fg='#ffaa00'
+                )
         else:
             # Normal mode: smooth interpolation
             self.info_label.config(
@@ -2737,6 +3144,8 @@ class ArmControlGUI(Node):
             steps: Number of interpolation steps
             delay_ms: Delay between steps in milliseconds
         """
+        self._cancel_pending_motion()
+        generation = self._drag_ik_generation
         # Get current positions
         start_angles = self.target_positions.copy()
         
@@ -2744,23 +3153,13 @@ class ArmControlGUI(Node):
         increments = [(target - start) / steps for start, target in zip(start_angles, target_angles)]
         
         def step_interpolation(current_step):
+            if (generation != self._drag_ik_generation
+                    or self._gui_shutdown.is_set()):
+                return
+            self._interpolation_after_id = None
             if current_step >= steps:
                 # Final step - set exact target
-                for i, angle in enumerate(target_angles):
-                    self.joint_sliders[i].set(angle)
-                    self.target_positions[i] = angle
-                
-                # Update 3D visualization
-                if self.viz_3d:
-                    joint_angles_dict = {
-                        'base': target_angles[0],
-                        'shoulder': target_angles[1],
-                        'elbow': target_angles[2],
-                        'forearm': target_angles[3],
-                        'wrist': target_angles[4],
-                        'gripper': target_angles[5]
-                    }
-                    self.viz_3d.update_from_ik_solution(joint_angles_dict)
+                self._set_joint_controls(target_angles)
                 
                 # Send final command
                 self.send_command()
@@ -2772,28 +3171,19 @@ class ArmControlGUI(Node):
                 return
             
             # Calculate intermediate angles
-            for i in range(6):
-                intermediate = start_angles[i] + increments[i] * current_step
-                self.joint_sliders[i].set(intermediate)
-                self.target_positions[i] = intermediate
+            intermediate_angles = [
+                start_angles[i] + increments[i] * current_step
+                for i in range(6)
+            ]
+            self._set_joint_controls(intermediate_angles)
             
             # Send intermediate command
             self.send_command()
             
-            # Update 3D visualization
-            if self.viz_3d:
-                joint_angles_dict = {
-                    'base': self.target_positions[0],
-                    'shoulder': self.target_positions[1],
-                    'elbow': self.target_positions[2],
-                    'forearm': self.target_positions[3],
-                    'wrist': self.target_positions[4],
-                    'gripper': self.target_positions[5]
-                }
-                self.viz_3d.update_from_ik_solution(joint_angles_dict)
-            
             # Schedule next step
-            self.root.after(delay_ms, lambda: step_interpolation(current_step + 1))
+            self._interpolation_after_id = self.root.after(
+                delay_ms, lambda: step_interpolation(current_step + 1)
+            )
         
         # Start interpolation
         step_interpolation(0)
@@ -2802,38 +3192,52 @@ class ArmControlGUI(Node):
         """Schedule a robot update with rate limiting"""
         if not self.update_pending:
             self.update_pending = True
-            self.root.after(int(self.update_interval * 1000), self.do_update)
+            generation = self._drag_ik_generation
+            self._update_after_id = self.root.after(
+                int(self.update_interval * 1000),
+                lambda: self.do_update(generation),
+            )
     
-    def do_update(self):
+    def do_update(self, generation=None):
         """Execute the robot update"""
+        if generation is not None and generation != self._drag_ik_generation:
+            return
+        self._update_after_id = None
         self.update_pending = False
-        self.send_command()
+        if self.realtime_mode.get():
+            self.send_command()
     
     def schedule_cartesian_update(self):
         """Schedule a cartesian IK update with rate limiting"""
         if not self.cartesian_update_pending:
+            self._cancel_pending_motion()
             self.cartesian_update_pending = True
-            self.root.after(int(self.update_interval * 1000), self.do_cartesian_update)
+            generation = self._drag_ik_generation
+            self._cartesian_update_after_id = self.root.after(
+                int(self.update_interval * 1000),
+                lambda: self.do_cartesian_update(generation),
+            )
     
-    def do_cartesian_update(self):
+    def do_cartesian_update(self, generation=None):
         """Execute the cartesian IK update"""
+        if generation is not None and generation != self._drag_ik_generation:
+            return
+        self._cartesian_update_after_id = None
         self.cartesian_update_pending = False
-        self.apply_cartesian_silent()
+        if self.realtime_mode.get():
+            self.apply_cartesian_silent()
     
     def apply_preset(self, angles):
-        """Apply preset joint angles"""
-        for i, angle in enumerate(angles):
-            self.joint_sliders[i].set(angle)
-            self.target_positions[i] = float(angle)
-        
-        # Update 3D visualization
-        if self.viz_3d:
-            self.viz_3d.set_joint_angles(self.target_positions)
-        
-        self.info_label.config(text=f"Preset applied. Click 'Send to Robot' to execute.")
+        """Apply preset joint angles, preserving entries marked as ``None``."""
+        self._take_manual_control()
+        self._set_joint_controls(angles)
+        if self.realtime_mode.get():
+            self.schedule_update()
+        else:
+            self.info_label.config(text="Preset applied. Click 'Send to Robot' to execute.")
     
-    def send_command(self):
-        """Publish joint commands to ROS2"""
+    def send_command(self, update_status=True):
+        """Publish joint commands, optionally skipping success-label repainting."""
         try:
             # ALWAYS send speed first before any movement
             # This ensures cartesian/IK movements also respect the speed slider
@@ -2841,57 +3245,61 @@ class ArmControlGUI(Node):
             speed_msg.data = float(self.speed_value.get())
             self.speed_pub.publish(speed_msg)
             
-            # Send GUI values directly to hardware (no offset needed)
-            # GUI 90° = Servo 90° = Home/upright position
+            # Send GUI logical degrees directly to the Raspberry Pi controller.
             # Ensure all values are native Python floats (not numpy floats)
             hardware_positions = [float(pos) for pos in self.target_positions]
+            gripper_target = hardware_positions[5]
+            if not (
+                self.gripper_open_degrees
+                <= gripper_target
+                <= self.gripper_closed_degrees
+            ):
+                self.info_label.config(
+                    text=(
+                        "✗ Gripper command rejected: calibrate "
+                        "RASHKO_GRIPPER_CLOSED_DEGREES first"
+                    ),
+                    fg='#ff0000',
+                )
+                self.get_logger().error(
+                    "Rejected gripper command %.1f; configured range is %.1f..%.1f"
+                    % (
+                        gripper_target,
+                        self.gripper_open_degrees,
+                        self.gripper_closed_degrees,
+                    )
+                )
+                return
             
             # Publish as Float32MultiArray for servo control
             msg = Float32MultiArray()
             msg.data = hardware_positions
             self.joint_pub.publish(msg)
             
-            # For RViz visualization: URDF joints expect 0 radians as the "home" position
-            # So we need to convert: GUI 90° should display as 0 radians in RViz
-            # This means: radians = (GUI_degrees - 90) * pi/180
-            # Some joints need inversion based on URDF joint axis orientation
-            joint_state_msg = JointState()
-            joint_state_msg.header.stamp = self.get_clock().now().to_msg()
-            # Publish all 6 joints including gripper_base for complete visualization
-            joint_state_msg.name = self.rviz_joint_names
-            
-            # Build joint positions for RViz (all 6 joints)
-            # The URDF has complex joint orientations, we need to match them:
-            # - base: normal (positive = counter-clockwise when viewed from above)
-            # - shoulder: inverted (positive in GUI = negative in URDF to lift arm up)
-            # - elbow: inverted (positive in GUI = negative in URDF to bend arm)
-            # - wrist (forearm): NEGATED to match hardware direction
-            # - wrist_rotate: normal
-            # - gripper_base: normal (controls gripper fingers)
-            rviz_positions = []
-            for i, pos in enumerate(self.target_positions):  # All 6 joints
-                if i == 1:  # Shoulder - invert for correct up/down motion
-                    rviz_positions.append(float(math.radians(90.0 - pos)))
-                elif i == 2:  # Elbow joint - invert for correct bend direction
-                    rviz_positions.append(float(math.radians(90.0 - pos)))
-                elif i == 3:  # Wrist (forearm pitch) - normal with negation to match hardware
-                    rviz_positions.append(float(-math.radians(pos - 90.0)))
-                else:
-                    # Normal conversion: 90° GUI = 0 rad RViz
-                    rviz_positions.append(float(math.radians(pos - 90.0)))
-            
-            joint_state_msg.position = rviz_positions
-            self.joint_state_pub.publish(joint_state_msg)
-            
-            # Publish green marker at actual gripper position in RViz
-            self.publish_gripper_marker()
+            # Publish the green actual-position marker only from real feedback.
+            # With no backend, retain the embedded target preview instead.
+            if ArmControlGUI._has_joint_feedback(self):
+                self.publish_gripper_marker()
+            else:
+                self._preview_targets_without_feedback()
             
             current_speed = self.speed_value.get()
-            self.info_label.config(
-                text=f"✓ Sent at {current_speed}% speed: {[f'{x:.1f}°' for x in hardware_positions]}",
-                fg='#00ff00'
-            )
-            self.get_logger().info(f"Published joint commands at speed {current_speed}: {hardware_positions}")
+            if update_status:
+                self.info_label.config(
+                    text=(
+                        f"✓ Sent at {current_speed}% speed: "
+                        f"{[f'{x:.1f}°' for x in hardware_positions]}"
+                    ),
+                    fg='#00ff00'
+                )
+            # rclpy's throttled logger still performs expensive work on every
+            # call. Auto-follow deliberately suppresses status updates, so keep
+            # its 25-30 Hz hot path free of the ~12 ms logging overhead too.
+            if update_status:
+                self.get_logger().info(
+                    f"Published joint commands at speed {current_speed}: "
+                    f"{hardware_positions}"
+                )
         except Exception as e:
             self.info_label.config(
                 text=f"✗ Error sending command: {str(e)}",
@@ -2902,17 +3310,16 @@ class ArmControlGUI(Node):
     def emergency_stop(self):
         """Toggle emergency stop - disables all servo outputs via PCA9685 OE pin"""
         try:
+            self._take_manual_control()
             self.estop_active = not self.estop_active
             
             # Publish emergency stop state
             msg = Bool()
             msg.data = self.estop_active
             self.estop_pub.publish(msg)
-            Elbow
             if self.estop_active:
                 self.info_label.config(text="⛔ EMERGENCY STOP ACTIVE - All outputs DISABLED!", fg='#ff0000')
                 self.get_logger().warning("Emergency stop ACTIVATED - OE pin HIGH")
-                Elbow
                 messagebox.showwarning(
                     "Emergency Stop ACTIVATED",
                     "All servo outputs DISABLED!\n\nPress Emergency Stop again to release."
@@ -2930,6 +3337,7 @@ class ArmControlGUI(Node):
     
     def apply_cartesian(self):
         """Apply cartesian coordinates using IK solver (with user feedback)"""
+        self._cancel_pending_motion()
         self._apply_cartesian_internal(show_feedback=True)
     
     def apply_cartesian_silent(self):
@@ -2954,10 +3362,10 @@ class ArmControlGUI(Node):
                     text=f"⚙ Calculating IK for position: X={x_mm}, Y={y_mm}, Z={z_mm} mm...",
                     fg='#ffaa00'
                 )
-                self.root.update()
+                # Do not re-enter Tk here: a manual/Home event processed by
+                # update() could be overwritten by this older solve afterward.
             
-            # Solve IK — automatically finds the best pitch so the
-            # gripper tip lands exactly on the target point
+            # The original point solver searches pitch freely for broad reach.
             joint_angles = self.solve_ik_to_point(x_m, y_m, z_m)
             
             if joint_angles is None:
@@ -2988,7 +3396,7 @@ class ArmControlGUI(Node):
             target_angles = [0.0] * 6
             for ik_joint, gui_idx in ik_to_gui_mapping.items():
                 angle = joint_angles[ik_joint]
-                hi = 270 if gui_idx == 0 else 180
+                hi = 245 if gui_idx == 0 else 180
                 angle = max(0, min(hi, angle))
                 target_angles[gui_idx] = angle
 
@@ -2996,22 +3404,9 @@ class ArmControlGUI(Node):
             # controls the arm joints, not the gripper.
             target_angles[5] = float(self.joint_sliders[5].get())
 
-            # --- Safety: reject if any joint would jump too far ---
-            if not self._check_joint_delta_safe(target_angles, label='Cart-IK'):
-                if show_feedback:
-                    messagebox.showwarning(
-                        "Movement Too Large",
-                        f"One or more joints would move more than "
-                        f"{self.MAX_JOINT_DELTA_DEG:.0f}° in a single step.\n\n"
-                        "Move the arm closer to the target first using "
-                        "the joint sliders, then try again."
-                    )
-                return
-
-            # Update sliders with IK solution
-            for gui_idx, angle in enumerate(target_angles):
-                self.joint_sliders[gui_idx].set(angle)
-                self.target_positions[gui_idx] = angle
+            # Update the complete IK result without invoking six independent
+            # user-slider callbacks.
+            self._set_joint_controls(target_angles)
             
             # Publish visualization marker at target position
             self.publish_target_marker(x_m, y_m, z_m)
@@ -3055,28 +3450,56 @@ class ArmControlGUI(Node):
     def joint_state_callback(self, msg):
         """Callback for joint state updates from ROS2"""
         try:
-            # Update current positions from feedback (if needed for monitoring)
-            if len(msg.position) >= 6:
-                # Could update GUI display with actual robot positions here
-                pass
+            feedback = list(self.current_positions)
+            indexes = {
+                name: index for index, name in enumerate(CONTRACT_JOINT_NAMES)
+            }
+            for name, position in zip(msg.name, msg.position):
+                if name in indexes:
+                    index = indexes[name]
+                    feedback[index] = radians_to_servo_degrees(index, position)
+            self.current_positions = feedback
+            if not self._feedback_initialized:
+                self._pending_initial_feedback = tuple(feedback)
         except Exception as e:
             self.get_logger().error(f"Joint state callback error: {str(e)}")
     
+    def _pi_status_callback(self, msg):
+        try:
+            payload = json.loads(msg.data)
+            code, states = payload['code'], payload['state']
+            if not isinstance(code, str) or not isinstance(states, list):
+                return
+            if any(not isinstance(state, str) for state in states):
+                return
+        except (ValueError, KeyError, TypeError):
+            return
+        self._pi_status = (time.monotonic(), code, frozenset(states))
+
+    def _update_link_status(self):
+        status = self._pi_status
+        color = '#ffbf69'
+        if status is None:
+            text = 'Pi: awaiting status · offline preview available'
+        else:
+            updated, code, states = status
+            if time.monotonic() - updated > self.LINK_STALE_S:
+                text = 'Pi: ACK stale · last commanded estimate only'
+                color = '#ff7777'
+            elif 'ESTOP_LATCHED' in states:
+                text = 'Pi: E-stop latched · MG996R position estimated'
+            elif code != 'OK':
+                text = f'Pi: {code} · MG996R position estimated'
+            else:
+                output = 'enabled' if 'OUTPUTS_ENABLED' in states else 'disabled'
+                text = f'Pi: ACK live · outputs {output} · MG996R position estimated'
+                color = '#85d890'
+        if text != self._link_status_text:
+            self.link_status_label.configure(text=text, fg=color)
+            self._link_status_text = text
+
     def publish_target_marker(self, x, y, z):
         """Publish a visualization marker at the target position in RViz"""
-        # The URDF base joint has an initial rotation of 2.23697 rad (~128°) around Z
-        # We need to rotate our coordinates to match the URDF frame
-        # Note: The URDF also has an XY offset of (0.0284, -0.00137) which we ignore for now
-        import math as m
-        urdf_base_yaw = 2.23697  # From URDF base joint rpy
-        
-        # Rotate coordinates by -urdf_base_yaw to align with URDF frame
-        cos_yaw = m.cos(-urdf_base_yaw)
-        sin_yaw = m.sin(-urdf_base_yaw)
-        x_rviz = x * cos_yaw - y * sin_yaw
-        y_rviz = x * sin_yaw + y * cos_yaw
-        z_rviz = z
-        
         marker = Marker()
         marker.header.frame_id = "base_link"
         marker.header.stamp = self.get_clock().now().to_msg()
@@ -3085,10 +3508,9 @@ class ArmControlGUI(Node):
         marker.type = Marker.SPHERE
         marker.action = Marker.ADD
         
-        # Position (in meters) - rotated to match URDF frame
-        marker.pose.position.x = x_rviz
-        marker.pose.position.y = y_rviz
-        marker.pose.position.z = z_rviz
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = z
         marker.pose.orientation.w = 1.0
         
         # Scale (sphere diameter in meters)
@@ -3109,37 +3531,25 @@ class ArmControlGUI(Node):
         self.get_logger().debug(f"Published target marker at ({x:.3f}, {y:.3f}, {z:.3f})")
     
     def publish_gripper_marker(self):
-        """Publish a visualization marker at the actual gripper position in RViz"""
-        # Use forward kinematics to calculate actual gripper position
-        base = self.target_positions[0]
-        shoulder = self.target_positions[1]
-        elbow = self.target_positions[2]
-        forearm = self.target_positions[3]
-        wrist = self.target_positions[4]
-        
-        # Calculate end effector position using MoveIt or fallback FK
-        x, y, z, pitch, roll = self.forward_kinematics(
+        """Publish the ACK-derived geometric gripper estimate in RViz."""
+        # GUI-only mode has no measured/acknowledged joint state.  Preserve the
+        # embedded command preview and do not publish the seeded HOME pose as a
+        # fake "actual" marker.  Simulation or hardware feedback takes over
+        # automatically after the first /joint_states message.
+        if not ArmControlGUI._has_joint_feedback(self):
+            return False
+
+        base, shoulder, elbow, forearm, wrist = self.current_positions[:5]
+        x, y, z, _pitch, _roll = self.forward_kinematics(
             base, shoulder, elbow, forearm, wrist
         )
+
+        self.get_logger().debug(
+            f'Feedback FK position: X={x:.3f}, Y={y:.3f}, Z={z:.3f}'
+        )
         
-        # Debug: Print FK position
-        self.get_logger().info(f'FK Position: X={x:.3f}, Y={y:.3f}, Z={z:.3f}')
-        
-        # Update Tkinter 3D visualization with actual FK position from TF
         if self.viz_3d:
-            self.viz_3d.set_joint_angles(self.target_positions)
-            # Set the actual gripper position from FK/TF for accurate green marker
-            self.viz_3d.set_actual_gripper_position(x, y, z)
-        
-        # The URDF base joint has an initial rotation of 2.23697 rad (~128°) around Z
-        # Rotate coordinates to match the URDF frame
-        import math as m
-        urdf_base_yaw = 2.23697
-        cos_yaw = m.cos(-urdf_base_yaw)
-        sin_yaw = m.sin(-urdf_base_yaw)
-        x_rviz = x * cos_yaw - y * sin_yaw
-        y_rviz = x * sin_yaw + y * cos_yaw
-        z_rviz = z
+            self.viz_3d.set_joint_angles(self.current_positions)
         
         marker = Marker()
         marker.header.frame_id = "base_link"
@@ -3149,10 +3559,9 @@ class ArmControlGUI(Node):
         marker.type = Marker.SPHERE
         marker.action = Marker.ADD
         
-        # Position (in meters) - rotated to match URDF frame
-        marker.pose.position.x = x_rviz
-        marker.pose.position.y = y_rviz
-        marker.pose.position.z = z_rviz
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = z
         marker.pose.orientation.w = 1.0
         
         # Scale (sphere diameter in meters)
@@ -3171,10 +3580,11 @@ class ArmControlGUI(Node):
         
         self.gripper_marker_pub.publish(marker)
         self.get_logger().debug(f"Published gripper marker at ({x:.3f}, {y:.3f}, {z:.3f})")
+        return True
     
     def spin_ros(self):
         """Spin ROS2 node in background thread"""
-        while rclpy.ok():
+        while rclpy.ok() and not self._gui_shutdown.is_set():
             try:
                 rclpy.spin_once(self, timeout_sec=0.1)
             except Exception as e:
@@ -3184,37 +3594,84 @@ class ArmControlGUI(Node):
     def update_gui(self):
         """Periodically update GUI elements"""
         try:
-            # Update status indicator
-            # Could add actual connection checking here
-            pass
+            self._update_link_status()
+            if (
+                not self._feedback_initialized
+                and self._pending_initial_feedback is not None
+            ):
+                self._initialize_gui_from_feedback(self._pending_initial_feedback)
+            elif self.viz_3d and self._feedback_initialized:
+                # ACK angles are the hardware-side applied-command estimate.
+                # Draw those five motor joints without adding fixed TF frames.
+                self.viz_3d.set_joint_angles(self.current_positions)
         except Exception as e:
             self.get_logger().error(f"GUI update error: {str(e)}")
         
         # Schedule next update
-        self.root.after(100, self.update_gui)
+        self._feedback_after_id = self.root.after(self.FEEDBACK_REFRESH_MS, self.update_gui)
+
+    def _initialize_gui_from_feedback(self, feedback):
+        """Align controls once with the live arm state when the GUI connects."""
+        self._set_joint_controls(feedback, preview=False)
+
+        self.viz_3d.set_joint_angles(feedback)
+        tool_position = self.custom_ik_solver.forward_kinematics(*feedback[:5])[:3]
+        self._set_cartesian_controls(
+            tool_position[0] * 1000.0,
+            tool_position[1] * 1000.0,
+            tool_position[2] * 1000.0,
+        )
+        self._feedback_initialized = True
+        self._pending_initial_feedback = None
+        self.get_logger().info("GUI controls synchronized with live joint feedback")
     
     def on_closing(self):
         """Cleanup on window close"""
+        if self._gui_shutdown.is_set():
+            return
+        self._gui_shutdown.set()
+        self._preview_ready.set()
         self.get_logger().info("Shutting down GUI...")
+        self._cancel_pending_motion()
+        for attribute in ('_drag_ik_poll_after_id', '_camera_after_id', '_feedback_after_id'):
+            after_id = getattr(self, attribute)
+            if after_id is not None:
+                self.root.after_cancel(after_id)
+                setattr(self, attribute, None)
+        if self.viz_3d is not None:
+            self.viz_3d.cancel_pending_callbacks()
         self._cleanup_camera()
+        if self.ros_thread.is_alive():
+            self.ros_thread.join(timeout=1.0)
+        if self._preview_thread is not None:
+            self._preview_thread.join(timeout=1.0)
         self.destroy_node()
         self.root.destroy()
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    from rclpy.signals import SignalHandlerOptions
+
+    if CV2_AVAILABLE:
+        cv2.setNumThreads(2)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     
     root = tk.Tk()
     app = ArmControlGUI(root)
     
     # Handle window close
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
+
+    def request_shutdown(_signum, _frame):
+        root.quit()
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
     
     try:
         root.mainloop()
-    except KeyboardInterrupt:
-        pass
     finally:
+        app.on_closing()
         if rclpy.ok():
             rclpy.shutdown()
 
