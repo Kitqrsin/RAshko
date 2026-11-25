@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from arm_controller.red_cap_visual_servo import VisualServoConfig
+from arm_controller.projects.caps.workcell.red_cap_visual_servo import VisualServoConfig
 
 
 CONFIGURATION_KIND = "cap_sequence_simulation"

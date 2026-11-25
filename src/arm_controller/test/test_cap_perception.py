@@ -7,7 +7,7 @@ import unittest
 import cv2
 import numpy as np
 
-from arm_controller.cap_perception import (
+from arm_controller.projects.caps.workcell.cap_perception import (
     CapPerception,
     CapSlot,
     FixtureLayout,

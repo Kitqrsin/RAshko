@@ -31,6 +31,22 @@ The base accepts `0..245` degrees. The other joints accept `0..180` degrees.
 ROS and URDF code call the sixth joint `gripper_base`; the wire-level position
 in the six-value array does not change.
 
+## Feature projects
+
+Standalone features live under `src/arm_controller/arm_controller/projects/`.
+The ROS launch files in `src/arm_controller/launch/` remain the entry points.
+
+- `caps/inspection/` holds live cap inspection and pick preview.
+- `caps/cap_sequence_simulation/` holds the offline cap sequence demo.
+- `caps/workcell/` holds cap geometry, perception, and fixture configuration
+  shared by the inspection and simulation features.
+- `camera_calibration/`, `face_tracking/`, `pick_and_place/`, and
+  `bartender/` hold their respective implementations.
+
+Shared kinematics, camera capture, servo mapping, and motion transport live at
+the top level of the Python package. Configure examples in the repository's
+`config/` folder.
+
 ## Windows setup
 
 Requirements:

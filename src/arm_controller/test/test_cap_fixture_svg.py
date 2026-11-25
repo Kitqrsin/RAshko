@@ -5,8 +5,8 @@ from pathlib import Path
 
 import cv2
 
-from arm_controller.cap_fixture_svg import generate_fixture_svg
-from arm_controller.cap_workcell_config import load_inspection_settings
+from arm_controller.projects.caps.workcell.cap_fixture_svg import generate_fixture_svg
+from arm_controller.projects.caps.workcell.cap_workcell_config import load_inspection_settings
 
 
 _CONFIG_PATH = Path(__file__).parents[3] / "config" / "cap_workcell.example.yaml"

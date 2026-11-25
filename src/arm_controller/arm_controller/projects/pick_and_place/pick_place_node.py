@@ -29,7 +29,7 @@ import os
 from arm_controller.joint_contract import HOME_DEGREES
 
 try:
-    from .ik_solver import ArmIKSolver
+    from arm_controller.ik_solver import ArmIKSolver
 except ImportError:
     from ik_solver import ArmIKSolver
 

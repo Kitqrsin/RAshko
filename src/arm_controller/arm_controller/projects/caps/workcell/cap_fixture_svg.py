@@ -8,11 +8,11 @@ from pathlib import Path
 
 import cv2
 
-from arm_controller.cap_workcell_config import (
+from arm_controller.projects.caps.workcell.cap_workcell_config import (
     InspectionSettings,
     load_inspection_settings,
 )
-from arm_controller.cap_motion_safety import (
+from arm_controller.projects.caps.workcell.cap_motion_safety import (
     FIXTURE_COORDINATE_CONVENTION,
     require_right_handed_fixture,
 )

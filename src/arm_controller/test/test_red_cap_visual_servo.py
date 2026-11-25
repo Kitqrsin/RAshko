@@ -5,7 +5,7 @@ import unittest
 import cv2
 import numpy as np
 
-from arm_controller.red_cap_visual_servo import (
+from arm_controller.projects.caps.workcell.red_cap_visual_servo import (
     RedBlobDetectorConfig,
     VisualServoConfig,
     VisualServoController,

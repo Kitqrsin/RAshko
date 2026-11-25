@@ -49,14 +49,14 @@ from std_msgs.msg import ColorRGBA, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
 
-from arm_controller.cap_sequence_simulation_config import (
+from arm_controller.projects.caps.cap_sequence_simulation.cap_sequence_simulation_config import (
     BoxVolume,
     CapSceneSlot,
     CylinderVolume,
     Point3,
     load_simulation_config,
 )
-from arm_controller.cap_sequence_simulation_safety import (
+from arm_controller.projects.caps.cap_sequence_simulation.cap_sequence_simulation_safety import (
     ACTION_STATUS_SUCCEEDED,
     FOLLOW_JOINT_TRAJECTORY_SUCCESS,
     CapSequenceSafetyError,
@@ -74,7 +74,7 @@ from arm_controller.joint_contract import (
     JOINT_NAMES,
     servo_degrees_to_radians,
 )
-from arm_controller.red_cap_visual_servo import (
+from arm_controller.projects.caps.workcell.red_cap_visual_servo import (
     RedBlobDetectorConfig,
     VisualServoController,
     detect_red_blobs,

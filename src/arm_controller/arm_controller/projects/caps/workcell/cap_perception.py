@@ -24,7 +24,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 import cv2
 import numpy as np
 
-from arm_controller.fixture_pose import (
+from arm_controller.projects.caps.workcell.fixture_pose import (
     FixturePoseEstimate,
     FixturePoseReference,
     compare_fixture_pose_to_reference,

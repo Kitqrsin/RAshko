@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from arm_controller.cap_workcell_config import (
+from arm_controller.projects.caps.workcell.cap_workcell_config import (
     hardware_execution_blockers,
     load_inspection_settings,
     load_source_destination_mapping,

@@ -6,7 +6,7 @@ import unittest
 import cv2
 import numpy as np
 
-from arm_controller.fixture_pose import (
+from arm_controller.projects.caps.workcell.fixture_pose import (
     FixturePoseReference,
     compare_fixture_pose_to_reference,
     estimate_fixture_pose,

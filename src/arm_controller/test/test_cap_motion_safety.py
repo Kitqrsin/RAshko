@@ -3,14 +3,14 @@ import dataclasses
 import unittest
 from pathlib import Path
 
-from arm_controller.cap_motion_safety import (
+from arm_controller.projects.caps.workcell.cap_motion_safety import (
     Point3,
     assert_no_low_lateral_motion,
     build_pick_preview,
     load_motion_geometry,
     motion_geometry_blockers,
 )
-from arm_controller.cap_workcell_config import load_inspection_settings
+from arm_controller.projects.caps.workcell.cap_workcell_config import load_inspection_settings
 
 
 _CONFIG_PATH = Path(__file__).parents[3] / "config" / "cap_workcell.example.yaml"

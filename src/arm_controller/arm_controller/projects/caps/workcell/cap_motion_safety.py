@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import math
 from typing import Any, Mapping, Optional, Sequence
 
-from arm_controller.cap_workcell_config import InspectionSettings
+from arm_controller.projects.caps.workcell.cap_workcell_config import InspectionSettings
 
 
 FIXTURE_COORDINATE_CONVENTION = "right_handed_z_up"

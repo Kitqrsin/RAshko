@@ -13,13 +13,13 @@ from typing import Any, Mapping
 
 import yaml
 
-from arm_controller.cap_perception import CapSlot, FixtureLayout, InspectorConfig
-from arm_controller.fixture_pose import FixturePoseReference
+from arm_controller.projects.caps.workcell.cap_perception import CapSlot, FixtureLayout, InspectorConfig
+from arm_controller.projects.caps.workcell.fixture_pose import FixturePoseReference
 from arm_controller.joint_contract import (
     GRIPPER_OPEN_DEGREES,
     validate_servo_degrees,
 )
-from arm_controller.red_cap_visual_servo import (
+from arm_controller.projects.caps.workcell.red_cap_visual_servo import (
     FixedJigReference,
     VisualServoConfig,
 )

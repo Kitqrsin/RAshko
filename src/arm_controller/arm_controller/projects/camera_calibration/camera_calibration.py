@@ -43,7 +43,9 @@ except ImportError:
     ROS_AVAILABLE = False
 
 
-CALIBRATION_DIR = os.path.dirname(os.path.abspath(__file__))
+CALIBRATION_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', '..')
+)
 DEFAULT_OUTPUT = os.path.join(CALIBRATION_DIR, 'camera_calibration.json')
 
 

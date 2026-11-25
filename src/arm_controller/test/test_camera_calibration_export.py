@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from arm_controller.camera_calibration_export import export_calibration_archive
+from arm_controller.projects.camera_calibration.camera_calibration_export import export_calibration_archive
 
 
 _VALID_YAML = b"""\

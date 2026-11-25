@@ -1,6 +1,6 @@
 import unittest
 
-from arm_controller.cap_sequence_simulation_safety import (
+from arm_controller.projects.caps.cap_sequence_simulation.cap_sequence_simulation_safety import (
     ACTION_STATUS_SUCCEEDED,
     DEFAULT_CAP_IDS,
     FOLLOW_JOINT_TRAJECTORY_SUCCESS,

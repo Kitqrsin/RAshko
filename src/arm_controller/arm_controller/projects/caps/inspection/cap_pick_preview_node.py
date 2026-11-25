@@ -20,13 +20,13 @@ from std_msgs.msg import String
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
-from arm_controller.cap_motion_safety import (
+from arm_controller.projects.caps.workcell.cap_motion_safety import (
     MotionGeometry,
     Point3,
     build_pick_preview,
     load_motion_geometry,
 )
-from arm_controller.cap_workcell_config import (
+from arm_controller.projects.caps.workcell.cap_workcell_config import (
     load_inspection_settings,
     load_source_destination_mapping,
 )

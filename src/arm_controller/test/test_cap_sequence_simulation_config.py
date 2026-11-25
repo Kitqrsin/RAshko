@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from arm_controller.cap_sequence_simulation_config import (
+from arm_controller.projects.caps.cap_sequence_simulation.cap_sequence_simulation_config import (
     CapSequenceSimulationConfig,
     load_simulation_config,
 )

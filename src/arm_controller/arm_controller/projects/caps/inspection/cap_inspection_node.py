@@ -23,19 +23,19 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
-from arm_controller.cap_perception import (
+from arm_controller.projects.caps.workcell.cap_perception import (
     CapPerception,
     ObservationStabilizer,
     SlotOccupancy,
     image_content_digest,
 )
-from arm_controller.cap_motion_safety import motion_geometry_blockers
-from arm_controller.cap_workcell_config import (
+from arm_controller.projects.caps.workcell.cap_motion_safety import motion_geometry_blockers
+from arm_controller.projects.caps.workcell.cap_workcell_config import (
     hardware_execution_blockers,
     load_inspection_settings,
 )
 from arm_controller.joint_contract import JOINT_NAMES, servo_degrees_to_radians
-from arm_controller.red_cap_visual_servo import (
+from arm_controller.projects.caps.workcell.red_cap_visual_servo import (
     VisualServoError,
     derive_fixed_cap_row_candidate,
     derive_fixed_jig_reference,
