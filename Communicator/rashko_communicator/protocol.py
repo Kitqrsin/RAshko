@@ -38,6 +38,7 @@ MAX_ANGLES_DEG = (245.0, 180.0, 180.0, 180.0, 180.0, 180.0)
 class MessageType(str, Enum):
     COMMAND = "command"
     HEARTBEAT = "heartbeat"
+    STATUS = "status"
     EMERGENCY_STOP = "estop"
     RESET_ESTOP = "reset_estop"
     ACK = "ack"
@@ -52,6 +53,7 @@ class AckCode(IntEnum):
     ESTOP_LATCHED = 5
     HARDWARE_ERROR = 6
     STALE_TIMESTAMP = 7
+    CONTROL_BUSY = 8
 
 
 class ControllerState(IntFlag):

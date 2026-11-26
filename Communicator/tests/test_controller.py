@@ -195,6 +195,29 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertEqual(denied.code, AckCode.ESTOP_LATCHED)
 
+    def test_status_and_foreign_session_cannot_keep_motion_alive_or_take_over(self) -> None:
+        ip = "192.168.1.10"
+        reset = request(MessageType.RESET_ESTOP, 0)
+        command = request(MessageType.COMMAND, 1, angles=(100, 90, 90, 90, 90, 90), speed=25)
+        self.controller.process(reset, ip, now_monotonic=10.0)
+        other_session = "a" * 32
+        foreign_command = replace(command, session_id=other_session)
+        denied = self.controller.process(foreign_command, ip, now_monotonic=10.05)
+        self.assertEqual(denied.code, AckCode.CONTROL_BUSY)
+        self.assertFalse(self.hardware.outputs_enabled)
+        accepted = self.controller.process(command, ip, now_monotonic=10.1)
+        self.assertEqual(accepted.code, AckCode.OK)
+
+        heartbeat = request(MessageType.HEARTBEAT, 2)
+        self.controller.process(heartbeat, ip, now_monotonic=10.3)
+        foreign_heartbeat = replace(heartbeat, session_id=other_session)
+        self.controller.process(foreign_heartbeat, ip, now_monotonic=10.6)
+        self.controller.process(request(MessageType.STATUS, 3), ip, now_monotonic=10.7)
+        self.assertEqual(self.controller.last_contact_at, 10.3)
+        self.controller.process(request(MessageType.HEARTBEAT, 4), ip, now_monotonic=10.9)
+        self.assertFalse(self.hardware.outputs_enabled)
+        self.assertTrue(self.controller.estop_latched)
+
     def test_replay_is_rejected_without_refreshing_watchdog(self) -> None:
         first = self.controller.process(
             request(MessageType.HEARTBEAT, 5),
@@ -210,7 +233,7 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertEqual(first.code, AckCode.OK)
         self.assertEqual(replay.code, AckCode.STALE_SEQUENCE)
-        self.assertEqual(self.controller.last_contact_at, 20.0)
+        self.assertIsNone(self.controller.last_contact_at)
 
     def test_session_is_bound_to_first_authenticated_client_ip(self) -> None:
         first = self.controller.process(
@@ -228,7 +251,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(first.code, AckCode.OK)
         self.assertEqual(wrong_source.code, AckCode.STALE_SEQUENCE)
         self.assertIn("another client", wrong_source.detail)
-        self.assertEqual(self.controller.last_contact_at, 20.0)
+        self.assertIsNone(self.controller.last_contact_at)
 
     def test_invalid_command_is_rejected_without_clamping(self) -> None:
         self.controller.process(
@@ -320,6 +343,93 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(
             server.handle_datagram(b"not even JSON", ("192.168.1.11", 12345))
         )
+
+    def test_server_allows_cidr_subnet_clients_and_discards_outside(self) -> None:
+        config = make_config(
+            allowed_clients=frozenset({"192.168.100.0/24", "169.254.0.0/16"})
+        )
+        controller = ArmController(config, DryRunHardware(config.hardware))
+
+        class FakeSocket:
+            def setblocking(self, _blocking: bool) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        server = UdpControllerServer(config, controller, FakeSocket())  # type: ignore[arg-type]
+
+        # Outside subnets and malformed client IPs are discarded before parsing.
+        for rejected_ip in ("192.168.101.15", "10.0.0.1", "not-an-ip", "::1"):
+            self.assertIsNone(
+                server.handle_datagram(b"not even JSON", (rejected_ip, 12345))
+            )
+
+        datagram_24 = encode_request(
+            MessageType.HEARTBEAT,
+            SESSION,
+            1,
+            secret=SECRET,
+            sent_at_ms=WALL_MS,
+        )
+        outside_signed = server.handle_datagram(
+            datagram_24,
+            ("192.168.101.15", 12345),
+            now_wall_ms=WALL_MS,
+            now_monotonic=1.0,
+        )
+        self.assertIsNone(outside_signed)
+
+        # Client inside /24 subnet is accepted and receives a signed ACK.
+        response_24 = server.handle_datagram(
+            datagram_24,
+            ("192.168.100.42", 12345),
+            now_wall_ms=WALL_MS,
+            now_monotonic=1.0,
+        )
+        self.assertIsNotNone(response_24)
+        ack_24 = decode_ack(response_24, secret=SECRET, now_ms=WALL_MS)  # type: ignore[arg-type]
+        self.assertEqual(ack_24.code, AckCode.OK)
+        self.assertEqual(ack_24.sequence, 1)
+
+        # Session IP binding still rejects a different IP even inside the same /24 subnet.
+        datagram_hijack = encode_request(
+            MessageType.HEARTBEAT,
+            SESSION,
+            2,
+            secret=SECRET,
+            sent_at_ms=WALL_MS,
+        )
+        hijack_response = server.handle_datagram(
+            datagram_hijack,
+            ("192.168.100.99", 12345),
+            now_wall_ms=WALL_MS,
+            now_monotonic=1.1,
+        )
+        self.assertIsNotNone(hijack_response)
+        hijack_ack = decode_ack(hijack_response, secret=SECRET, now_ms=WALL_MS)  # type: ignore[arg-type]
+        self.assertEqual(hijack_ack.code, AckCode.STALE_SEQUENCE)
+        self.assertIn("another client", hijack_ack.detail)
+
+        # Client inside /16 link-local subnet is accepted on its own session.
+        other_session = "0123456789abcdef0123456789abcdef"
+        datagram_16 = encode_request(
+            MessageType.HEARTBEAT,
+            other_session,
+            1,
+            secret=SECRET,
+            sent_at_ms=WALL_MS,
+        )
+        response_16 = server.handle_datagram(
+            datagram_16,
+            ("169.254.77.88", 12345),
+            now_wall_ms=WALL_MS,
+            now_monotonic=1.2,
+        )
+        self.assertIsNotNone(response_16)
+        ack_16 = decode_ack(response_16, secret=SECRET, now_ms=WALL_MS)  # type: ignore[arg-type]
+        self.assertEqual(ack_16.code, AckCode.OK)
+        self.assertEqual(ack_16.sequence, 1)
 
     def test_server_authenticates_and_returns_signed_ack(self) -> None:
         class FakeSocket:

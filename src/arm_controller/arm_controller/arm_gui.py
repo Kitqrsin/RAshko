@@ -50,12 +50,20 @@ except ImportError:
 # Import IK solvers and 3D visualization
 from arm_controller.ik_solver import ArmIKSolver
 from arm_controller.arm_3d_visualization import Arm3DVisualization
+from arm_controller.urdf_kinematics import UrdfKinematics
 from arm_controller.joint_contract import (
     GRIPPER_OPEN_DEGREES,
     HOME_DEGREES,
     JOINT_NAMES as CONTRACT_JOINT_NAMES,
     radians_to_servo_degrees,
     servo_degrees_to_radians,
+)
+from arm_controller.pi_endpoint import (
+    discover_pi_host,
+    probe_pi_candidate,
+    resolve_pi_endpoint,
+    update_dotenv_pi_host,
+    validate_pi_host,
 )
 
 # Import in-process object detector for camera overlay
@@ -112,7 +120,7 @@ class ArmControlGUI(Node):
     CAMERA_STALE_S = 2.0
     LINK_STALE_S = 1.0
 
-    def __init__(self, root):
+    def __init__(self, root, *, cartesian_chain=''):
         super().__init__('arm_control_gui')
         self.camera_feature_enabled = bool(
             self.declare_parameter('camera_enabled', True).value
@@ -184,10 +192,10 @@ class ArmControlGUI(Node):
         self._pending_initial_feedback = None
         self._feedback_initialized = False
         
-        # Initialize IK solvers
-        # Keep mouse Cartesian control on the original geometric model.  MoveIt
-        # remains available for its own planning workflows, but its additional
-        # fixed URDF frames are not GUI joints and are not used by drag IK.
+        cartesian_chain = self.declare_parameter('cartesian_chain', cartesian_chain).value
+        if not cartesian_chain:
+            raise ValueError('Launch view_with_gui.launch.py to supply the Cartesian chain.')
+        self.urdf_kinematics = UrdfKinematics(cartesian_chain)
         self.custom_ik_solver = ArmIKSolver()
         self._ik_solver_lock = threading.Lock()
         # 3D visualization (will be set up in setup_gui)
@@ -313,6 +321,9 @@ class ArmControlGUI(Node):
             10
         )
         self._pi_status = None
+        self._pi_status_endpoint = None
+        self._pi_probe_busy = False
+        self._pi_probe_results = queue.SimpleQueue()
         self._link_status_text = None
         self.pi_status_sub = self.create_subscription(
             String, '/raspberry/status', self._pi_status_callback, 1
@@ -370,7 +381,6 @@ class ArmControlGUI(Node):
         )
         
         # Track emergency stop state
-        self.estop_active = False
         
         # GUI Elements
         self.setup_gui()
@@ -701,6 +711,22 @@ class ArmControlGUI(Node):
             entry.pack(side=tk.LEFT, padx=3)
             self.cartesian_entries[axis] = entry
 
+        pitch_row = tk.Frame(cartesian_frame, bg='#3b3b3b')
+        pitch_row.pack(fill=tk.X, padx=10)
+        self.hold_tool_pitch = tk.BooleanVar(value=False)
+        self.tool_pitch_degrees = tk.DoubleVar(value=0.0)
+        tk.Checkbutton(
+            pitch_row, text="Set tool pitch", variable=self.hold_tool_pitch,
+            command=self._cancel_pending_motion, bg='#3b3b3b', fg='white',
+            selectcolor='#444444', activebackground='#3b3b3b',
+        ).pack(side=tk.LEFT)
+        tk.Scale(
+            pitch_row, from_=-90, to=90, orient=tk.HORIZONTAL,
+            variable=self.tool_pitch_degrees, label="-90° down / +90° up",
+            command=lambda _: self._cancel_pending_motion(),
+            bg='#3b3b3b', fg='white', highlightthickness=0,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         ik_btn = tk.Button(
             cartesian_frame,
             text="Move to Position (IK)",
@@ -721,10 +747,10 @@ class ArmControlGUI(Node):
             viz_panel,
             self.custom_ik_solver,
             on_target_move_callback=self.on_3d_target_move,
+            urdf_kinematics=self.urdf_kinematics,
         )
-        
-        # Sync initial cartesian values to 3D viz
-        self.viz_3d.set_target(0.0, 0.0, 0.2)
+        home_tip = self.viz_3d.calculate_tool_tip()
+        self._set_cartesian_controls(*(value * 1000 for value in home_tip))
         
         # ---- Start / Stop Cartesian Auto-Follow Button ----
         self.start_stop_btn = tk.Button(
@@ -776,6 +802,9 @@ class ArmControlGUI(Node):
             height=2
         )
         stop_btn.pack(pady=5, padx=10, fill=tk.X)
+        tk.Button(
+            button_frame, text="Reset E-stop", command=self.reset_emergency_stop
+        ).pack(padx=10, fill=tk.X)
         
         # Info panel at bottom
         info_frame = tk.Frame(self.root, bg='#2b2b2b')
@@ -796,6 +825,63 @@ class ArmControlGUI(Node):
             info_frame, bg='#3b3b3b', anchor='w', padx=10, pady=3,
         )
         self.link_status_label.pack(fill=tk.X)
+
+        pi_conn_frame = tk.Frame(info_frame, bg='#333333', padx=10, pady=4)
+        pi_conn_frame.pack(fill=tk.X, pady=(2, 0))
+
+        tk.Label(
+            pi_conn_frame,
+            text="Pi Target (Ethernet):",
+            font=('Arial', 9, 'bold'),
+            bg='#333333',
+            fg='#cccccc',
+        ).pack(side=tk.LEFT)
+
+        self.pi_host_var = tk.StringVar(value=self._initial_pi_host())
+        self.pi_host_entry = tk.Entry(
+            pi_conn_frame,
+            textvariable=self.pi_host_var,
+            width=20,
+            font=('Consolas', 9),
+            bg='#222222',
+            fg='#ffffff',
+            insertbackground='#ffffff',
+        )
+        self.pi_host_entry.bind('<Return>', lambda _e: self.apply_pi_host_from_gui())
+        self.pi_host_entry.pack(side=tk.LEFT, padx=(6, 4))
+
+        self.pi_apply_btn = tk.Button(
+            pi_conn_frame,
+            text="Apply IP",
+            font=('Arial', 8, 'bold'),
+            bg='#005f87',
+            fg='white',
+            activebackground='#0077aa',
+            command=self.apply_pi_host_from_gui,
+        )
+        self.pi_apply_btn.pack(side=tk.LEFT, padx=2)
+
+        self.pi_discover_btn = tk.Button(
+            pi_conn_frame,
+            text="Auto-Find Pi",
+            font=('Arial', 8, 'bold'),
+            bg='#2d6a4f',
+            fg='white',
+            activebackground='#40916c',
+            command=self.discover_pi_from_gui,
+        )
+        self.pi_discover_btn.pack(side=tk.LEFT, padx=2)
+
+        self.pi_target_hint_label = tk.Label(
+            pi_conn_frame,
+            text=self._initial_pi_hint(),
+            font=('Arial', 8),
+            bg='#333333',
+            fg='#9ec5fe',
+            anchor='w',
+            padx=8,
+        )
+        self.pi_target_hint_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
     
     # ------------------------------------------------------------------ #
     #  Camera Feed                                                         #
@@ -2224,7 +2310,7 @@ class ArmControlGUI(Node):
         pitch = shoulder_rad + elbow_rad + forearm_rad
 
         # EE position from FK
-        fk = self.forward_kinematics(base, shoulder, elbow, forearm, wrist)
+        fk = self.custom_ik_solver.forward_kinematics(base, shoulder, elbow, forearm, wrist)
         ee_x, ee_y, ee_z = fk[0], fk[1], fk[2]
         r_ee = math.sqrt(ee_x**2 + ee_y**2)
 
@@ -2285,12 +2371,14 @@ class ArmControlGUI(Node):
             try_z = max(0.02, self._GRAB_L_BASE + try_dz)
             try_x = try_r * math.cos(target_base_rad)
             try_y = try_r * math.sin(target_base_rad)
-            ik = self.solve_ik_to_point(
-                try_x,
-                try_y,
-                try_z,
-                gripper_angle=self.gripper_open_degrees,
-            )
+            with self._ik_solver_lock:
+                ik = self.custom_ik_solver.solve_ik_to_point(
+                    try_x, try_y, try_z, gripper_angle=self.gripper_open_degrees,
+                    seed_state=dict(zip(
+                        ('base', 'shoulder', 'elbow', 'forearm', 'wrist'),
+                        self.target_positions,
+                    )),
+                )
             if ik:
                 if pct < 1.0:
                     self.get_logger().info(
@@ -2306,7 +2394,7 @@ class ArmControlGUI(Node):
             return
 
         # --- Verify IK result direction ---
-        fk2 = self.forward_kinematics(
+        fk2 = self.custom_ik_solver.forward_kinematics(
             ik['base'], ik['shoulder'], ik['elbow'],
             ik['forearm'], ik['wrist'])
         ik_r = math.sqrt(fk2[0]**2 + fk2[1]**2)
@@ -2828,8 +2916,11 @@ class ArmControlGUI(Node):
                 seed_state,
             )
     
-    def solve_ik_to_point(self, x, y, z, gripper_angle=None):
-        """Solve XYZ with the original free-pitch geometric point solver."""
+    def _selected_tool_elevation(self):
+        return math.radians(self.tool_pitch_degrees.get()) if self.hold_tool_pitch.get() else None
+
+    def solve_ik_to_point(self, x, y, z, gripper_angle=None, tool_elevation=None):
+        """Solve a tool-tip target in base_link, with optional physical pitch."""
         seed_state = {
             'base': self.target_positions[0],
             'shoulder': self.target_positions[1],
@@ -2841,27 +2932,35 @@ class ArmControlGUI(Node):
             x,
             y,
             z,
-            gripper_angle,
+            self.target_positions[5] if gripper_angle is None else gripper_angle,
             seed_state,
+            tool_elevation,
         )
 
     def _solve_ik_to_point_with_seed(
-        self, x, y, z, gripper_angle, seed_state
+        self, x, y, z, gripper_angle, seed_state, tool_elevation=None
     ):
-        """Call the unchanged point solver under its cross-thread lock."""
-        with self._ik_solver_lock:
-            return self.custom_ik_solver.solve_ik_to_point(
-                x,
-                y,
-                z,
-                roll=0.0,
-                gripper_angle=gripper_angle,
-                seed_state=seed_state,
-            )
+        """Solve using the same URDF and joint mapping as robot_state_publisher."""
+        names = ('base', 'shoulder', 'elbow', 'forearm', 'wrist')
+        degrees = [seed_state[name] for name in names] + [gripper_angle]
+        seed = servo_degrees_to_radians(degrees)[:5]
+        solution = self.urdf_kinematics.solve(
+            (x, y, z), tool_elevation, seed, wrist_roll=seed[4]
+        )
+        if solution is None:
+            return None
+        angles = {
+            name: radians_to_servo_degrees(index, angle)
+            for index, (name, angle) in enumerate(zip(names, solution.radians))
+        }
+        return {**angles, 'gripper': gripper_angle}
 
     def forward_kinematics(self, base, shoulder, elbow, forearm, wrist):
-        """Calculate XYZ with the same geometry used by mouse IK and canvas."""
-        return self.custom_ik_solver.forward_kinematics(base, shoulder, elbow, forearm, wrist)
+        """Calculate XYZ and physical tool elevation in base_link."""
+        angles = servo_degrees_to_radians((base, shoulder, elbow, forearm, wrist, 0.0))[:5]
+        pose = self.urdf_kinematics.forward(angles)
+        elevation = math.asin(float(np.clip(pose.tool_direction[2], -1.0, 1.0)))
+        return (*pose.position, elevation, angles[4])
 
     def _drag_widgets_due(self):
         """Limit secondary Scale/Entry repainting while preserving arm frames."""
@@ -2894,6 +2993,7 @@ class ArmControlGUI(Node):
             seed_values,
         ))
         request['gripper_angle'] = float(self.target_positions[5])
+        request['tool_elevation'] = self._selected_tool_elevation()
         self._drag_ik_running = True
         threading.Thread(
             target=self._drag_ik_worker,
@@ -2914,6 +3014,7 @@ class ArmControlGUI(Node):
                 z,
                 request['gripper_angle'],
                 request['seed_state'],
+                request['tool_elevation'],
             )
         except Exception as exc:  # delivered to the Tk thread for ROS logging
             error = exc
@@ -3048,8 +3149,9 @@ class ArmControlGUI(Node):
             self._queue_drag_ik(x, y, z, update_widgets)
             return
 
-        # The original point solver searches pitch freely for broad reach.
-        joint_angles = self.solve_ik_to_point(x, y, z)
+        joint_angles = self.solve_ik_to_point(
+            x, y, z, tool_elevation=self._selected_tool_elevation()
+        )
 
         self._apply_3d_target_solution(
             x,
@@ -3308,33 +3410,17 @@ class ArmControlGUI(Node):
             self.get_logger().error(f"Failed to publish: {str(e)}")
     
     def emergency_stop(self):
-        """Toggle emergency stop - disables all servo outputs via PCA9685 OE pin"""
-        try:
-            self._take_manual_control()
-            self.estop_active = not self.estop_active
-            
-            # Publish emergency stop state
-            msg = Bool()
-            msg.data = self.estop_active
-            self.estop_pub.publish(msg)
-            if self.estop_active:
-                self.info_label.config(text="⛔ EMERGENCY STOP ACTIVE - All outputs DISABLED!", fg='#ff0000')
-                self.get_logger().warning("Emergency stop ACTIVATED - OE pin HIGH")
-                messagebox.showwarning(
-                    "Emergency Stop ACTIVATED",
-                    "All servo outputs DISABLED!\n\nPress Emergency Stop again to release."
-                )
-            else:
-                self.info_label.config(text="✓ Emergency stop released - Outputs enabled", fg='#00ff00')
-                self.get_logger().info("Emergency stop RELEASED - OE pin LOW")
-                
-                messagebox.showinfo(
-                    "Emergency Stop Released",
-                    "Servo outputs re-enabled.\nYou can now control the arm."
-                )
-        except Exception as e:
-            self.get_logger().error(f"Emergency stop failed: {str(e)}")
-    
+        self._take_manual_control()
+        self.estop_pub.publish(Bool(data=True))
+        self.info_label.config(text="E-stop requested. Check the Pi status below.", fg='#ff0000')
+
+    def reset_emergency_stop(self):
+        if self._pi_probe_busy:
+            return
+        self._take_manual_control()
+        self.estop_pub.publish(Bool(data=False))
+        self.info_label.config(text="Reset requested. Wait for confirmation before moving.", fg='#ffbf69')
+
     def apply_cartesian(self):
         """Apply cartesian coordinates using IK solver (with user feedback)"""
         self._cancel_pending_motion()
@@ -3366,7 +3452,9 @@ class ArmControlGUI(Node):
                 # update() could be overwritten by this older solve afterward.
             
             # The original point solver searches pitch freely for broad reach.
-            joint_angles = self.solve_ik_to_point(x_m, y_m, z_m)
+            joint_angles = self.solve_ik_to_point(
+                x_m, y_m, z_m, tool_elevation=self._selected_tool_elevation()
+            )
             
             if joint_angles is None:
                 if show_feedback:
@@ -3464,6 +3552,139 @@ class ArmControlGUI(Node):
         except Exception as e:
             self.get_logger().error(f"Joint state callback error: {str(e)}")
     
+    def _initial_pi_host(self):
+        try:
+            return str(resolve_pi_endpoint()["pi_host"])
+        except Exception:
+            return "192.168.1.50"
+
+    def _initial_pi_hint(self):
+        try:
+            ep = resolve_pi_endpoint()
+            subnet = str(ep.get("subnet_hint", "")).strip()
+            if subnet:
+                return f"Ethernet subnet: {subnet} · live reload active"
+        except Exception:
+            pass
+        return "Saves to .env.windows · bridge & camera reload automatically"
+
+    def _set_pi_target_hint(self, text, color='#9ec5fe'):
+        label = getattr(self, 'pi_target_hint_label', None)
+        if label is not None:
+            label.configure(text=text, fg=color)
+
+    def apply_pi_host_from_gui(self):
+        """Authenticate the requested Raspberry Pi before saving it."""
+        if self._pi_probe_busy:
+            return
+        raw_value = self.pi_host_var.get().strip()
+        try:
+            cleaned = validate_pi_host(raw_value, allow_auto=True)
+        except ValueError as exc:
+            self._set_pi_target_hint(f"Invalid host: {exc}", '#ff7777')
+            return
+
+        if cleaned == "auto":
+            self.discover_pi_from_gui()
+            return
+
+        self._set_pi_target_hint(f"Authenticating {cleaned}...", '#ffbf69')
+        self._start_pi_background_probe(mode='probe', target_host=cleaned)
+
+    def discover_pi_from_gui(self):
+        """Scan configured hostnames and Ethernet /24 subnet in the background."""
+        if getattr(self, '_pi_probe_busy', False):
+            return
+        self._set_pi_target_hint("Scanning Ethernet for RAshko Raspberry Pi...", '#ffbf69')
+        self._start_pi_background_probe(mode='discover', target_host=self.pi_host_var.get().strip())
+
+    def _start_pi_background_probe(self, *, mode, target_host):
+        if getattr(self, '_pi_probe_busy', False):
+            return
+        self._pi_probe_busy = True
+        for btn_name in ('pi_apply_btn', 'pi_discover_btn'):
+            btn = getattr(self, btn_name, None)
+            if btn is not None:
+                btn.configure(state=tk.DISABLED)
+
+        def worker():
+            try:
+                ep = resolve_pi_endpoint()
+                pi_port = int(ep["pi_port"])
+                camera_port = int(ep["camera_port"])
+                subnet_hint = str(ep.get("subnet_hint", ""))
+                pi_hostname = str(ep.get("pi_hostname", ""))
+                secret = os.environ.get("RASHKO_SHARED_SECRET", "")
+                allow_insecure = os.environ.get("RASHKO_ALLOW_INSECURE", "").strip().lower() in {
+                    "1", "true", "yes", "on"
+                }
+                if mode == 'discover':
+                    extra = [pi_hostname] if pi_hostname else []
+                    found = discover_pi_host(
+                        current_host=target_host,
+                        subnet_hint=subnet_hint,
+                        extra_hostnames=extra,
+                        pi_port=pi_port,
+                        camera_port=camera_port,
+                        secret=secret,
+                        allow_insecure=allow_insecure,
+                    )
+                    if found is not None:
+                        host = str(found["host"])
+                        outcome = ('found', host, str(found.get("detail", "")))
+                    else:
+                        outcome = ('not_found', '', subnet_hint)
+                else:
+                    probe = probe_pi_candidate(
+                        target_host,
+                        pi_port=pi_port,
+                        camera_port=camera_port,
+                        secret=secret,
+                        allow_insecure=allow_insecure,
+                    )
+                    outcome = (
+                        'found' if secret and probe.get("udp_ok") else 'unverified',
+                        str(probe["host"]),
+                        str(probe.get("detail", "")),
+                    )
+            except Exception as exc:
+                outcome = ('error', '', str(exc))
+
+            if not self._gui_shutdown.is_set():
+                self._pi_probe_results.put(outcome)
+
+        threading.Thread(target=worker, name='rashko-gui-pi-probe', daemon=True).start()
+
+    def _finish_pi_background_probe(self, outcome):
+        self._pi_probe_busy = False
+        if self._gui_shutdown.is_set():
+            return
+        for btn_name in ('pi_apply_btn', 'pi_discover_btn'):
+            btn = getattr(self, btn_name, None)
+            if btn is not None:
+                btn.configure(state=tk.NORMAL)
+
+        kind, host, detail = outcome
+        if kind == 'found':
+            try:
+                update_dotenv_pi_host(host)
+            except (OSError, UnicodeError) as exc:
+                self._set_pi_target_hint(f"Could not save Pi target: {exc}", '#ff7777')
+                return
+            self._take_manual_control()
+            self.pi_host_var.set(host)
+            self._set_pi_target_hint(f"Saved {host}. Verify video and reset E-stop.", '#85d890')
+        elif kind == 'not_found':
+            hint = f" on {detail}" if detail else ""
+            self._set_pi_target_hint(
+                f"No verified Pi answered{hint} (use raspberry-console.cmd Discover on Windows)",
+                '#ffbf69',
+            )
+        elif kind == 'unverified':
+            self._set_pi_target_hint(f"Could not authenticate {host} ({detail})", '#ffbf69')
+        else:
+            self._set_pi_target_hint(f"Pi check error: {detail}", '#ff7777')
+
     def _pi_status_callback(self, msg):
         try:
             payload = json.loads(msg.data)
@@ -3474,25 +3695,31 @@ class ArmControlGUI(Node):
                 return
         except (ValueError, KeyError, TypeError):
             return
+        host = payload.get('host')
+        port = payload.get('port')
+        if isinstance(host, str) and host:
+            self._pi_status_endpoint = f"{host}:{port}" if isinstance(port, int) else host
         self._pi_status = (time.monotonic(), code, frozenset(states))
 
     def _update_link_status(self):
         status = self._pi_status
+        endpoint = getattr(self, '_pi_status_endpoint', None)
+        prefix = f"Pi [{endpoint}]:" if endpoint else "Pi:"
         color = '#ffbf69'
         if status is None:
-            text = 'Pi: awaiting status · offline preview available'
+            text = f'{prefix} awaiting status · offline preview available'
         else:
             updated, code, states = status
             if time.monotonic() - updated > self.LINK_STALE_S:
-                text = 'Pi: ACK stale · last commanded estimate only'
+                text = f'{prefix} ACK stale · last commanded estimate only'
                 color = '#ff7777'
-            elif 'ESTOP_LATCHED' in states:
-                text = 'Pi: E-stop latched · MG996R position estimated'
+            elif code in ('OK', 'RESET_REQUIRED') and 'ESTOP_LATCHED' in states:
+                text = f'{prefix} E-stop latched · MG996R position estimated'
             elif code != 'OK':
-                text = f'Pi: {code} · MG996R position estimated'
+                text = f'{prefix} {code} · MG996R position estimated'
             else:
                 output = 'enabled' if 'OUTPUTS_ENABLED' in states else 'disabled'
-                text = f'Pi: ACK live · outputs {output} · MG996R position estimated'
+                text = f'{prefix} ACK live · outputs {output} · MG996R position estimated'
                 color = '#85d890'
         if text != self._link_status_text:
             self.link_status_label.configure(text=text, fg=color)
@@ -3595,6 +3822,12 @@ class ArmControlGUI(Node):
         """Periodically update GUI elements"""
         try:
             self._update_link_status()
+            try:
+                outcome = self._pi_probe_results.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self._finish_pi_background_probe(outcome)
             if (
                 not self._feedback_initialized
                 and self._pending_initial_feedback is not None
@@ -3615,7 +3848,7 @@ class ArmControlGUI(Node):
         self._set_joint_controls(feedback, preview=False)
 
         self.viz_3d.set_joint_angles(feedback)
-        tool_position = self.custom_ik_solver.forward_kinematics(*feedback[:5])[:3]
+        tool_position = self.forward_kinematics(*feedback[:5])[:3]
         self._set_cartesian_controls(
             tool_position[0] * 1000.0,
             tool_position[1] * 1000.0,

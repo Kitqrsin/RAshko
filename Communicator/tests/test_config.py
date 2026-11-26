@@ -7,7 +7,9 @@ from pathlib import Path
 
 from rashko_communicator.config import (
     ConfigError,
+    ControllerConfig,
     default_hardware_config,
+    is_client_allowed,
     load_controller_config,
     load_hardware_config,
 )
@@ -149,6 +151,92 @@ class ConfigTests(unittest.TestCase):
             env_path.write_text("BROKEN_LINE", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "KEY=value"):
                 load_controller_config({}, env_file=env_path)
+
+    def test_allowlist_supports_ipv4_cidr_subnets_and_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_controller_config(
+                {
+                    "RASHKO_ENV_FILE": str(Path(directory) / "missing.env"),
+                    "RASHKO_SHARED_SECRET": SECRET,
+                    "RASHKO_ALLOWED_CLIENTS": (
+                        "192.168.100.15/24, 169.254.0.0/16, 192.168.1.10, 10.0.0.5/32"
+                    ),
+                }
+            )
+            self.assertEqual(
+                config.allowed_clients,
+                frozenset(
+                    {
+                        "192.168.100.0/24",
+                        "169.254.0.0/16",
+                        "192.168.1.10",
+                        "10.0.0.5/32",
+                    }
+                ),
+            )
+            self.assertTrue(is_client_allowed("192.168.100.42", config.allowed_clients))
+            self.assertTrue(is_client_allowed("169.254.12.34", config.allowed_clients))
+            self.assertTrue(is_client_allowed("192.168.1.10", config.allowed_clients))
+            self.assertTrue(is_client_allowed("10.0.0.5", config.allowed_clients))
+            self.assertFalse(is_client_allowed("192.168.101.42", config.allowed_clients))
+            self.assertFalse(is_client_allowed("not-an-ip", config.allowed_clients))
+            self.assertFalse(is_client_allowed("::1", config.allowed_clients))
+
+    def test_allowlist_rejects_wildcards_ipv6_and_malformed_entries(self) -> None:
+        invalid_cases = (
+            ("0.0.0.0/0", r"/0 wildcard"),
+            ("192.168.1.0/0", r"/0 wildcard"),
+            ("::1", r"IPv4 only"),
+            ("fe80::/64", r"IPv4 only"),
+            ("::/0", r"IPv4 only"),
+            ("not-an-ip", r"invalid RASHKO_ALLOWED_CLIENTS"),
+            ("192.168.1.256", r"invalid RASHKO_ALLOWED_CLIENTS"),
+            ("192.168.1.0/33", r"invalid RASHKO_ALLOWED_CLIENTS"),
+            ("192.168.1.0/abc", r"invalid RASHKO_ALLOWED_CLIENTS"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            missing_env = str(Path(directory) / "missing.env")
+            for raw_value, pattern in invalid_cases:
+                with self.subTest(raw_value=raw_value):
+                    with self.assertRaisesRegex(ConfigError, pattern):
+                        load_controller_config(
+                            {
+                                "RASHKO_ENV_FILE": missing_env,
+                                "RASHKO_SHARED_SECRET": SECRET,
+                                "RASHKO_ALLOWED_CLIENTS": raw_value,
+                            }
+                        )
+
+    def test_direct_controller_config_validates_allowed_clients(self) -> None:
+        base_kwargs = dict(
+            bind_host="127.0.0.1",
+            port=5005,
+            shared_secret=SECRET,
+            allow_insecure=False,
+            watchdog_ms=500,
+            freshness_ms=5000,
+            update_hz=50.0,
+            max_sessions=8,
+            hardware_backend="dry-run",
+            servo_config_path=Path("unused.json"),
+            hardware=default_hardware_config(),
+        )
+        valid = ControllerConfig(
+            allowed_clients=frozenset({"192.168.100.0/24"}),
+            **base_kwargs,
+        )
+        self.assertEqual(valid.allowed_clients, frozenset({"192.168.100.0/24"}))
+
+        for bad_clients in (
+            frozenset({"0.0.0.0/0"}),
+            frozenset({"fe80::/64"}),
+            frozenset({"::1"}),
+            frozenset({"not-an-ip"}),
+            frozenset({""}),
+        ):
+            with self.subTest(bad_clients=bad_clients):
+                with self.assertRaises(ConfigError):
+                    ControllerConfig(allowed_clients=bad_clients, **base_kwargs)
 
 
 if __name__ == "__main__":

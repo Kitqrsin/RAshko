@@ -94,6 +94,25 @@ class ArmGuiCameraRefreshTests(unittest.TestCase):
         ArmControlGUI._update_link_status(gui)
         self.assertIn("ACK stale", label.calls[-1]["text"])
 
+    def test_pi_status_displays_active_endpoint_when_published(self):
+        label = _RecordingLabel()
+        gui = SimpleNamespace(
+            _pi_status=None,
+            _pi_status_endpoint=None,
+            _link_status_text=None,
+            link_status_label=label,
+            LINK_STALE_S=ArmControlGUI.LINK_STALE_S,
+        )
+        ArmControlGUI._pi_status_callback(
+            gui,
+            SimpleNamespace(
+                data='{"host":"192.168.100.42","port":5005,"code":"OK","state":["HARDWARE_READY"]}'
+            ),
+        )
+        ArmControlGUI._update_link_status(gui)
+        self.assertIn("Pi [192.168.100.42:5005]:", label.calls[-1]["text"])
+        self.assertIn("MG996R position estimated", label.calls[-1]["text"])
+
     @patch("arm_controller.arm_gui.ImageTk.PhotoImage", return_value=object())
     def test_identical_placeholder_is_rendered_once(self, photo_image):
         label = _RecordingLabel()

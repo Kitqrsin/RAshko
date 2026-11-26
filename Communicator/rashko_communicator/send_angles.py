@@ -32,7 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly permit unsigned packets (commissioning only)",
     )
     action = parser.add_mutually_exclusive_group()
-    action.add_argument("--heartbeat", action="store_true", help="send a heartbeat only")
+    action.add_argument("--heartbeat", action="store_true", help="send a motion-session heartbeat")
+    action.add_argument("--status", action="store_true", help="request status without renewing the motion watchdog")
     action.add_argument("--estop", action="store_true", help="latch emergency stop")
     action.add_argument(
         "--reset-estop",
@@ -44,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
-    is_control = arguments.heartbeat or arguments.estop or arguments.reset_estop
+    is_control = arguments.status or arguments.heartbeat or arguments.estop or arguments.reset_estop
     if is_control and arguments.angles:
         raise SystemExit("angles cannot be supplied with a control-only option")
     if not is_control and len(arguments.angles) != 6:
@@ -58,7 +59,9 @@ def run(argv: Sequence[str] | None = None) -> int:
             secret=secret,
             allow_insecure=arguments.allow_insecure,
         ) as client:
-            if arguments.heartbeat:
+            if arguments.status:
+                sequence = client.send_status()
+            elif arguments.heartbeat:
                 sequence = client.send_heartbeat()
             elif arguments.estop:
                 sequence = client.send_emergency_stop()

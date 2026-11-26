@@ -195,6 +195,7 @@ class ControllerConfig:
             raise ConfigError(
                 f"RASHKO_HARDWARE_BACKEND must be one of {sorted(VALID_BACKENDS)}"
             )
+        compile_allowed_clients(self.allowed_clients)
 
 
 def default_hardware_config() -> HardwareConfig:
@@ -388,19 +389,93 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return result
 
 
+def _parse_allowed_client_entry(
+    raw_item: str,
+) -> tuple[str, ipaddress.IPv4Address | ipaddress.IPv4Network]:
+    item = raw_item.strip()
+    if not item:
+        raise ConfigError("RASHKO_ALLOWED_CLIENTS entries must not be empty")
+    if "/" in item:
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError as exc:
+            raise ConfigError(f"invalid RASHKO_ALLOWED_CLIENTS subnet: {item}") from exc
+        if network.version != 4:
+            raise ConfigError("RASHKO_ALLOWED_CLIENTS currently supports IPv4 only")
+        if network.prefixlen == 0:
+            raise ConfigError(
+                "RASHKO_ALLOWED_CLIENTS cannot contain a /0 wildcard; "
+                "leave it empty to allow any LAN client"
+            )
+        return str(network), network
+    try:
+        address = ipaddress.ip_address(item)
+    except ValueError as exc:
+        raise ConfigError(f"invalid RASHKO_ALLOWED_CLIENTS address: {item}") from exc
+    if address.version != 4:
+        raise ConfigError("RASHKO_ALLOWED_CLIENTS currently supports IPv4 only")
+    return str(address), address
+
+
+def compile_allowed_clients(
+    entries: frozenset[str],
+) -> tuple[frozenset[str], tuple[ipaddress.IPv4Network, ...]]:
+    """Validate and compile allowlist entries into exact IPv4 strings and CIDR networks."""
+    if not isinstance(entries, frozenset):
+        raise ConfigError("RASHKO_ALLOWED_CLIENTS must be a frozenset of strings")
+    exact_ips: set[str] = set()
+    networks: list[ipaddress.IPv4Network] = []
+    seen_networks: set[ipaddress.IPv4Network] = set()
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ConfigError("RASHKO_ALLOWED_CLIENTS entries must be strings")
+        normalized, parsed = _parse_allowed_client_entry(entry)
+        if isinstance(parsed, ipaddress.IPv4Network):
+            if parsed not in seen_networks:
+                seen_networks.add(parsed)
+                networks.append(parsed)
+        else:
+            exact_ips.add(normalized)
+    return frozenset(exact_ips), tuple(networks)
+
+
+def matches_allowed_clients(
+    client_ip: str,
+    exact_ips: frozenset[str],
+    networks: tuple[ipaddress.IPv4Network, ...],
+) -> bool:
+    """Return True when the allowlist is empty or client_ip matches an IPv4 entry."""
+    if not exact_ips and not networks:
+        return True
+    if client_ip in exact_ips:
+        return True
+    if not networks:
+        return False
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    if address.version != 4:
+        return False
+    return any(address in network for network in networks)
+
+
+def is_client_allowed(client_ip: str, allowed_clients: frozenset[str]) -> bool:
+    """Return True when client_ip is allowed by allowed_clients."""
+    if not allowed_clients:
+        return True
+    exact_ips, networks = compile_allowed_clients(allowed_clients)
+    return matches_allowed_clients(client_ip, exact_ips, networks)
+
+
 def _parse_allowed_clients(raw: str) -> frozenset[str]:
     result: set[str] = set()
     for item in raw.split(","):
         item = item.strip()
         if not item:
             continue
-        try:
-            address = ipaddress.ip_address(item)
-        except ValueError as exc:
-            raise ConfigError(f"invalid RASHKO_ALLOWED_CLIENTS address: {item}") from exc
-        if address.version != 4:
-            raise ConfigError("RASHKO_ALLOWED_CLIENTS currently supports IPv4 only")
-        result.add(str(address))
+        normalized, _ = _parse_allowed_client_entry(item)
+        result.add(normalized)
     return frozenset(result)
 
 

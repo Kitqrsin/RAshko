@@ -12,7 +12,7 @@ from arm_controller.joint_contract import (
     SERVO_MIN_DEGREES,
     servo_degrees_to_radians,
 )
-from arm_controller.urdf_kinematics import UrdfKinematics
+from arm_controller.urdf_kinematics import UrdfKinematics, compact_tool_chain
 
 
 class UrdfKinematicsTests(unittest.TestCase):
@@ -59,6 +59,22 @@ class UrdfKinematicsTests(unittest.TestCase):
             (-0.02050078, -0.05274810, 0.99839739),
             atol=1e-7,
         )
+
+    def test_gui_chain_keeps_exact_geometry_without_the_cad_model(self):
+        chain = compact_tool_chain(self.description)
+        root = ET.fromstring(chain)
+        self.assertEqual(len(root.findall('joint')), 6)
+        self.assertFalse(root.findall('.//mesh'))
+        self.assertFalse(root.findall('.//visual'))
+        self.assertFalse(root.findall('.//collision'))
+        gui_model = UrdfKinematics(chain)
+        angles = servo_degrees_to_radians((105, 80, 110, 70, 100, 0))[:5]
+        pose = gui_model.forward(angles)
+        reference = self.model.forward(angles)
+        self.assertEqual(len(pose.joint_positions), 5)
+        np.testing.assert_array_equal(pose.joint_positions, reference.joint_positions)
+        np.testing.assert_array_equal(pose.position, reference.position)
+        np.testing.assert_array_equal(pose.tool_direction, reference.tool_direction)
 
     def test_downward_pose_is_not_solved_as_upward(self):
         solution = self.model.solve(

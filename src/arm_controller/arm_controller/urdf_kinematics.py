@@ -21,6 +21,7 @@ class ForwardResult:
     position: np.ndarray
     rotation: np.ndarray
     link_positions: tuple[tuple[float, float, float], ...]
+    joint_positions: tuple[tuple[float, float, float], ...]
 
     @property
     def tool_direction(self) -> np.ndarray:
@@ -44,6 +45,29 @@ class _Joint:
     upper: float
 
 
+def _chain_elements(robot_description, base_link, tip_link):
+    root = ET.fromstring(robot_description)
+    child_to_joint = {
+        joint.find("child").attrib["link"]: joint for joint in root.findall("joint")
+    }
+    elements = []
+    current_link = tip_link
+    while current_link != base_link:
+        if current_link not in child_to_joint:
+            raise ValueError(f"URDF has no joint chain from {base_link} to {tip_link}")
+        joint_element = child_to_joint[current_link]
+        elements.append(joint_element)
+        current_link = joint_element.find("parent").attrib["link"]
+    return list(reversed(elements))
+
+
+def compact_tool_chain(robot_description: str) -> str:
+    """Extract joint transforms and limits for the GUI's lightweight schematic."""
+    chain = ET.Element("robot", name="cartesian_chain")
+    chain.extend(_chain_elements(robot_description, "base_link", "tool_tip"))
+    return ET.tostring(chain, encoding="unicode")
+
+
 class UrdfKinematics:
     """Kinematics for the exact ``base_link`` to ``tool_tip`` URDF chain."""
 
@@ -53,27 +77,9 @@ class UrdfKinematics:
         base_link: str = "base_link",
         tip_link: str = "tool_tip",
     ):
-        root = ET.fromstring(robot_description)
-        child_to_joint = {}
-        for joint_element in root.findall("joint"):
-            child = joint_element.find("child").attrib["link"]
-            child_to_joint[child] = joint_element
-
-        elements = []
-        current_link = tip_link
-        while current_link != base_link:
-            if current_link not in child_to_joint:
-                raise ValueError(
-                    f"URDF has no joint chain from {base_link} to {tip_link}"
-                )
-            joint_element = child_to_joint[current_link]
-            elements.append(joint_element)
-            current_link = joint_element.find("parent").attrib["link"]
-        elements.reverse()
-
         self._segments = []
         active_names = []
-        for element in elements:
+        for element in _chain_elements(robot_description, base_link, tip_link):
             name = element.attrib["name"]
             joint_type = element.attrib.get("type", "fixed")
             origin_element = element.find("origin")
@@ -118,10 +124,12 @@ class UrdfKinematics:
 
         transform = np.eye(4, dtype=float)
         positions = [(0.0, 0.0, 0.0)]
+        joint_positions = []
         active_index = 0
         for _, origin, joint in self._segments:
             transform = transform @ origin
             if joint is not None:
+                joint_positions.append(tuple(float(value) for value in transform[:3, 3]))
                 transform = transform @ _axis_rotation(joint.axis, values[active_index])
                 active_index += 1
             positions.append(tuple(float(value) for value in transform[:3, 3]))
@@ -130,6 +138,7 @@ class UrdfKinematics:
             position=transform[:3, 3].copy(),
             rotation=transform[:3, :3].copy(),
             link_positions=tuple(positions),
+            joint_positions=tuple(joint_positions),
         )
 
     def solve(
@@ -253,7 +262,8 @@ class UrdfKinematics:
                     (target_position, TOOL_DIRECTION_SCALE * target_direction)
                 )
             residual = desired - current
-            if np.linalg.norm(residual[:3]) < 0.0015:
+            position_tolerance = 0.0015 if include_direction else 0.0003
+            if np.linalg.norm(residual[:3]) < position_tolerance:
                 if not include_direction:
                     break
                 current_direction = current[3:] / TOOL_DIRECTION_SCALE

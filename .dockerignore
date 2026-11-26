@@ -11,6 +11,8 @@ __pycache__/
 # Git
 .git/
 .gitignore
+.env.windows
+..env.windows.*.tmp
 
 # IDE
 .vscode/

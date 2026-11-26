@@ -79,6 +79,9 @@ class UdpArmClient:
     def send_heartbeat(self) -> int:
         return self._send(MessageType.HEARTBEAT)
 
+    def send_status(self) -> int:
+        return self._send(MessageType.STATUS)
+
     def send_emergency_stop(self) -> int:
         return self._send(MessageType.EMERGENCY_STOP)
 
