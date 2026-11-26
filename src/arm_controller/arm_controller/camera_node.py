@@ -33,6 +33,7 @@ from arm_controller.camera_info_loader import (
     load_camera_info_yaml,
     require_matching_resolution,
 )
+from arm_controller.pi_endpoint import default_camera_url
 
 # Detect if we are running inside a Docker container
 IN_DOCKER = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
@@ -66,16 +67,7 @@ except ImportError:
 
 def _default_camera_url():
     """Return an explicit URL or derive one from the configured Pi address."""
-    configured_url = os.environ.get('RASHKO_CAMERA_URL', '').strip()
-    if configured_url:
-        return configured_url
-
-    pi_host = os.environ.get('RASHKO_PI_HOST', '').strip()
-    if not pi_host:
-        return ''
-
-    camera_port = os.environ.get('RASHKO_CAMERA_PORT', '8080').strip() or '8080'
-    return f'http://{pi_host}:{camera_port}/stream.mjpg'
+    return default_camera_url()
 
 
 class CameraNode(Node):
@@ -107,6 +99,9 @@ class CameraNode(Node):
         self.device_id = int(self.get_parameter('device_id').value)
         self.backend = str(self.get_parameter('camera_backend').value).strip().lower()
         self.camera_url = str(self.get_parameter('camera_url').value).strip()
+        self._dynamic_camera_url = (
+            not str(os.environ.get('RASHKO_CAMERA_URL', '')).strip()
+        ) and (self.camera_url == _default_camera_url())
         self.camera_timeout = max(
             float(self.get_parameter('camera_timeout').value), 0.25
         )
@@ -318,12 +313,13 @@ class CameraNode(Node):
 
     def _network_mjpeg_worker(self):
         """Continuously read complete JPEGs, reconnecting after failures."""
-        request = urllib.request.Request(
-            self.camera_url,
-            headers={'User-Agent': 'RAshko-camera-node/1.0'},
-        )
-
         while not self._shutdown_event.is_set():
+            self._refresh_camera_url()
+            request = urllib.request.Request(
+                self.camera_url, headers={'User-Agent': 'RAshko-camera-node/1.0'},
+            )
+            next_url_check = time.monotonic() + 0.25
+            switch_stream = False
             response = None
             try:
                 response = urllib.request.urlopen(
@@ -343,6 +339,12 @@ class CameraNode(Node):
                     chunk = response.read1(4096)
                     if not chunk:
                         raise EOFError('camera stream closed the connection')
+                    now = time.monotonic()
+                    if self._dynamic_camera_url and now >= next_url_check:
+                        next_url_check = now + 0.25
+                        if self._refresh_camera_url():
+                            switch_stream = True
+                            break
                     stream_buffer.extend(chunk)
                     self._extract_network_frames(stream_buffer)
 
@@ -363,7 +365,27 @@ class CameraNode(Node):
                     except Exception:
                         pass
 
-            self._shutdown_event.wait(self.camera_reconnect_delay)
+            if not switch_stream:
+                self._shutdown_event.wait(self.camera_reconnect_delay)
+
+    def _refresh_camera_url(self):
+        if not self._dynamic_camera_url:
+            return False
+        try:
+            latest_url = _default_camera_url()
+        except (OSError, ValueError):
+            return False
+        if not latest_url or latest_url == self.camera_url:
+            return False
+        if urlparse(latest_url).scheme not in ('http', 'https'):
+            return False
+        self.camera_url = latest_url
+        with self._network_data_lock:
+            self._network_jpeg = None
+            self._network_consumed_sequence = self._network_sequence
+            self._network_preview_sequence = self._network_sequence
+        self._set_network_state('connecting', f'Switching camera to {self.camera_url}')
+        return True
 
     def _extract_network_frames(self, stream_buffer):
         """Consume complete JPEGs, retaining only the newest from this read."""

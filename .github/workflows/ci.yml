@@ -2,56 +2,59 @@ name: CI
 
 on:
   push:
-    branches: [ '**' ]
+    branches: [main]
   pull_request:
-    branches: [ '**' ]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    name: Test & Lint
+    name: ROS Humble and Communicator tests
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: [3.11]
+    container: ros:humble
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      ROS_DOMAIN_ID: '177'
+      ROS_LOCALHOST_ONLY: '1'
+      RASHKO_TEST_TK: '1'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Install ROS and test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3-pip python3-tk xvfb xauth \
+            ros-humble-ament-copyright ros-humble-ament-flake8 ros-humble-ament-pep257 \
+            ros-humble-control-msgs ros-humble-moveit-msgs ros-humble-robot-state-publisher
+          python3 -m pip install 'numpy<2' 'opencv-contrib-python-headless>=4.6,<4.12' Pillow 'pytest>=7,<8' PyYAML
+
+      - name: Run controller, GUI, and Communicator tests
+        run: |
+          source /opt/ros/humble/setup.bash
+          export PYTHONPATH="$PWD/src/arm_controller:$PWD/Communicator${PYTHONPATH:+:$PYTHONPATH}"
+          python3 -m unittest discover -s Communicator/tests -v
+          xvfb-run -a python3 -m pytest -q src/arm_controller/test
+
+  windows-network:
+    name: Windows Ethernet and UDP compatibility
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install ROS ament test packages (for packaging tests)
-        run: |
-          # Add ROS2 apt repository and install ament test helpers required by package tests
-          sudo apt update && sudo apt install -y curl gnupg lsb-release
-          sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg || true
-          echo "deb [signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/ros2.list
-          sudo apt update
-          sudo apt install -y ros-humble-ament-copyright ros-humble-ament-flake8 ros-humble-ament-pep257 || true
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f src/requirements.txt ]; then pip install -r src/requirements.txt || true; fi
-          pip install -e src/arm_controller
-          pip install pytest flake8
-
-      - name: Run flake8
-        run: |
-          echo "Running flake8..."
-          flake8 src || true
-
-      - name: Run tests
-        run: |
-          pytest -q
+          python-version: '3.12'
+      - name: Run Windows networking tests
+        shell: pwsh
+        run: ./tests/test_raspberry_network.ps1 -PythonPath (Get-Command python).Source

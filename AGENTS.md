@@ -1,6 +1,8 @@
 # RAshko agent handoff
 
 This file is for coding agents, not end-user documentation.
+See also [`GEMINI.md`](GEMINI.md) for the Ethernet auto-discovery, live `.env.windows`
+endpoint reload, GUI Pi-target bar, and CIDR allowlist reference log.
 
 ## Supported architecture
 
@@ -59,22 +61,19 @@ This file is for coding agents, not end-user documentation.
 - RViz and the Tk GUI run through VcXsrv; `windows.ps1` owns starting display `:0`.
 - Live command `[105, 80, 110, 70, 100, 95]` reached the exact simulated target
   at 25 percent speed and both UI processes remained healthy.
-- The GUI mouse target deliberately uses the original five-point geometric
-  `ArmIKSolver` for its canvas, FK, and IK. Do not feed URDF/TF link origins into
-  that canvas: fixed frames were previously rendered as two extra motor joints.
-  MoveIt and `urdf_kinematics.py` remain available for the separate exact-URDF
-  planning and simulation tests.
-- GUI point following leaves tool pitch free, searches both signed elbow
-  branches, and accepts/rejects based on verified endpoint error. Never restore
-  the nearby-point fallback: it made the gripper stop separately from the target.
+- The launch extracts a compact joint chain from the RViz URDF for GUI
+  Cartesian IK and the Tk schematic. Keep the GUI free of visual meshes and
+  draw only the five active motor joints and a separate tool-tip segment.
+- GUI point following leaves tool pitch free unless the user selects a pitch.
+  Never restore the nearby-point fallback: it made the gripper stop separately from the target.
   GUI and RViz markers use `base_link`; never restore the removed hard-coded
   2.23697-radian marker rotation.
 - The calibrated logical home is `[90, 88, 90, 96, 98, 0]` degrees. The final
   value is the gripper on PCA9685 channel 6. The URDF limits are derived from
   the logical servo ranges around this per-joint home.
 - The standalone exact-URDF Cartesian residuals are up 0.4 mm/1.7 degrees,
-  horizontal 3.1 mm/3.2 degrees, and down 1.4 mm/0.5 degrees. These validate
-  MoveIt/TF, not the GUI mouse-drag geometric solver.
+  horizontal 3.1 mm/3.2 degrees, and down 1.4 mm/0.5 degrees. The CI Tk suite
+  additionally tests canvas drag through simulated servos and published TF.
 - `windows.ps1` deliberately refuses to start duplicate backend or GUI launch
   processes. Multiple `/compute_ik` servers caused nondeterministic CLI hangs.
 - ROS 2 Humble's packaged MoveIt 2.5.9 currently segfaults only while the

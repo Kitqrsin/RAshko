@@ -38,8 +38,7 @@ RUN pip3 install --no-cache-dir \
     py_trees \
     && pip3 uninstall -y opencv-python \
     && pip3 install --no-cache-dir --force-reinstall --no-deps \
-        "opencv-contrib-python>=4.6,<4.12" \
-    && pip3 cache purge 2>/dev/null || true
+        "opencv-contrib-python>=4.6,<4.12"
 
 WORKDIR /workspace
 

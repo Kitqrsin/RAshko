@@ -155,7 +155,7 @@ Set:
 
 ```text
 RASHKO_SHARED_SECRET=<the exact RASHKO_SHARED_SECRET from .env.windows>
-RASHKO_ALLOWED_CLIENTS=<the laptop's LAN IPv4 address>
+RASHKO_ALLOWED_CLIENTS=<laptop IPv4 or subnet CIDR, e.g. 192.168.100.0/24,169.254.0.0/16>
 RASHKO_HARDWARE_BACKEND=dry-run
 ```
 
@@ -242,8 +242,8 @@ cd C:\Users\User\Desktop\RAshko
 .\windows.ps1 Ping
 ```
 
-`Ping` sends a signed application heartbeat. It is not ICMP ping and it does
-not enable outputs. A healthy dry-run response contains an `OK` code with
+`Ping` sends a signed status request. It leaves motion and watchdog timing
+alone. A healthy dry-run response contains an `OK` code with
 `HARDWARE_READY`, `ESTOP_LATCHED`, and `WATCHDOG_TRIPPED`.
 
 Test the E-stop:
@@ -252,14 +252,16 @@ Test the E-stop:
 .\windows.ps1 EStop
 ```
 
-To test reset without moving hardware:
+To test reset without moving hardware, start the Windows hardware backend
+against the dry-run Pi. Reset must go through the running bridge.
 
 ```powershell
 .\windows.ps1 ResetEStop
 ```
 
-The reset response should still include `WATCHDOG_TRIPPED` and should not
-include `OUTPUTS_ENABLED`.
+Check `/raspberry/status` for `OK`, `WATCHDOG_TRIPPED` and disabled outputs
+after reset. Only that UDP session can issue a joint target or renew the
+motion watchdog. A signed E-stop can come from any allowlisted client.
 
 ## 6. Commission the PCA9685 with servo power off
 

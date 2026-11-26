@@ -10,7 +10,13 @@ import threading
 import time
 from collections import OrderedDict
 
-from .config import ConfigError, ControllerConfig, load_controller_config
+from .config import (
+    ConfigError,
+    ControllerConfig,
+    compile_allowed_clients,
+    load_controller_config,
+    matches_allowed_clients,
+)
 from .hardware import HardwareError, ServoHardware, create_hardware
 from .protocol import (
     MAX_DATAGRAM_BYTES,
@@ -47,6 +53,7 @@ class ArmController:
         self.speed_percent = 1.0
         self.last_contact_at: float | None = None
         self.last_update_at: float | None = None
+        self._motion_owner: tuple[str, str] | None = None
         self._sessions: OrderedDict[str, tuple[str, int]] = OrderedDict()
         # Constructor has no PWM write or enable call: startup cannot move the
         # arm. Explicitly assert OE HIGH even if a future driver forgot to.
@@ -79,6 +86,11 @@ class ArmController:
         now_wall_ms: int | None = None,
     ) -> Ack:
         now = time.monotonic() if now_monotonic is None else now_monotonic
+        if request.kind is MessageType.STATUS:
+            # Diagnostics must not change watchdog timing or evict motion sessions.
+            return self._ack(request, AckCode.OK, "status", now_wall_ms)
+        self._expire_watchdog(now)
+        sender = (request.session_id, client_ip)
         previous = self._sessions.get(request.session_id)
         if previous is not None:
             previous_ip, previous_sequence = previous
@@ -98,10 +110,14 @@ class ArmController:
         self._sessions[request.session_id] = (client_ip, request.sequence)
         self._sessions.move_to_end(request.session_id)
         while len(self._sessions) > self.config.max_sessions:
+            oldest = next(iter(self._sessions))
+            if self._motion_owner is not None and oldest == self._motion_owner[0]:
+                self._sessions.move_to_end(oldest)
             self._sessions.popitem(last=False)
 
         if request.kind is MessageType.EMERGENCY_STOP:
-            self.last_contact_at = now
+            self._motion_owner = None
+            self.last_contact_at = None
             self.estop_latched = True
             self.watchdog_tripped = True
             self.target_angles = self.current_angles
@@ -112,7 +128,11 @@ class ArmController:
             return self._ack(request, AckCode.OK, "emergency stop latched", now_wall_ms)
 
         if request.kind is MessageType.RESET_ESTOP:
-            self.last_contact_at = now
+            if self.hardware.outputs_enabled and self._motion_owner != sender:
+                return self._ack(request, AckCode.CONTROL_BUSY, "another session owns motion", now_wall_ms)
+            self._motion_owner = None
+            self.last_contact_at = None
+            self.target_angles = self.current_angles
             # Reset never enables or writes PWM.  Keep OE HIGH until a subsequent
             # fresh, valid command has been received.
             if not self._disable_outputs():
@@ -120,6 +140,7 @@ class ArmController:
                 return self._ack(
                     request, AckCode.HARDWARE_ERROR, "failed to hold outputs disabled", now_wall_ms
                 )
+            self._motion_owner = sender
             self.estop_latched = False
             self.watchdog_tripped = True
             return self._ack(
@@ -130,8 +151,10 @@ class ArmController:
             )
 
         if request.kind is MessageType.HEARTBEAT:
-            self.last_contact_at = now
-            # A heartbeat maintains already-enabled output but never enables it.
+            if self._motion_owner == sender:
+                self.last_contact_at = now
+            elif self._motion_owner is not None:
+                return self._ack(request, AckCode.CONTROL_BUSY, "another session owns motion", now_wall_ms)
             return self._ack(request, AckCode.OK, "heartbeat", now_wall_ms)
 
         if request.kind is not MessageType.COMMAND:
@@ -167,6 +190,8 @@ class ArmController:
                 request, AckCode.HARDWARE_ERROR, "servo hardware is not ready", now_wall_ms
             )
 
+        if self._motion_owner != sender:
+            return self._ack(request, AckCode.CONTROL_BUSY, "reset is required in this motion session", now_wall_ms)
         self.last_contact_at = now
         self.target_angles = angles
         self.speed_percent = speed
@@ -189,8 +214,7 @@ class ArmController:
         self.watchdog_tripped = False
         return self._ack(request, AckCode.OK, "motion target accepted", now_wall_ms)
 
-    def tick(self, now_monotonic: float | None = None) -> None:
-        now = time.monotonic() if now_monotonic is None else now_monotonic
+    def _expire_watchdog(self, now: float) -> None:
         if (
             self.hardware.outputs_enabled
             and (
@@ -201,9 +225,14 @@ class ArmController:
             self.watchdog_tripped = True
             self.estop_latched = True
             self.target_angles = self.current_angles
+            self._motion_owner = None
+            self.last_contact_at = None
             self._disable_outputs()
             self.last_update_at = now
-            return
+
+    def tick(self, now_monotonic: float | None = None) -> None:
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        self._expire_watchdog(now)
         if (
             not self.hardware.outputs_enabled
             or self.estop_latched
@@ -261,6 +290,7 @@ class ArmController:
             return False
 
     def _hardware_failure(self) -> None:
+        self._motion_owner = None
         self.hardware_ready = False
         self.estop_latched = True
         self.watchdog_tripped = True
@@ -298,6 +328,9 @@ class UdpControllerServer:
     ) -> None:
         self.config = config
         self.controller = controller
+        self._allowed_exact_ips, self._allowed_networks = compile_allowed_clients(
+            config.allowed_clients
+        )
         self.socket = udp_socket or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if udp_socket is None:
             self.socket.bind((config.bind_host, config.port))
@@ -312,7 +345,11 @@ class UdpControllerServer:
         now_monotonic: float | None = None,
     ) -> bytes | None:
         client_ip = address[0]
-        if self.config.allowed_clients and client_ip not in self.config.allowed_clients:
+        if not matches_allowed_clients(
+            client_ip,
+            self._allowed_exact_ips,
+            self._allowed_networks,
+        ):
             LOGGER.warning("discarded packet from non-allowlisted client %s", client_ip)
             return None
         try:

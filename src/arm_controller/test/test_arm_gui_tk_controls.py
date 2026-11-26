@@ -1,28 +1,45 @@
 """Opt-in real Tk event tests, isolated from every hardware command topic.
 
 Run with RASHKO_TEST_TK=1, ROS_DOMAIN_ID=177, ROS_LOCALHOST_ONLY=1 and DISPLAY.
-Command publishers are recording fakes; no simulation/UDP backend is launched.
+The Cartesian TF test uses the simulated servos on remapped command topics.
 """
 
 import math
 import os
+from pathlib import Path
+import subprocess
+from tempfile import TemporaryDirectory
 import threading
 import time
 import tkinter as tk
 import unittest
 
 import rclpy
+from ament_index_python.packages import get_package_prefix
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformException, TransformListener
+import yaml
 
 from arm_controller.arm_gui import ArmControlGUI
 from arm_controller.joint_contract import HOME_DEGREES
+from arm_controller.sim_servo_node import SimServoNode
+from arm_controller.tool_pose import TOOL_LINK, tool_direction
+from arm_controller.urdf_kinematics import compact_tool_chain
+
+
+URDF_PATH = Path(__file__).resolve().parents[3] / 'robot_urdf' / 'robot_fixed.urdf'
 
 
 class RecordingPublisher:
-    def __init__(self):
+    def __init__(self, publisher=None):
         self.messages = []
+        self.publisher = publisher
 
     def publish(self, message):
         self.messages.append(message)
+        if self.publisher is not None:
+            self.publisher.publish(message)
 
 
 @unittest.skipUnless(os.environ.get('RASHKO_TEST_TK') == '1', 'opt-in Tk integration')
@@ -37,7 +54,11 @@ class TkControlTests(unittest.TestCase):
             '-r', '/emergency_stop:=/gui_regression/emergency_stop',
         ])
         self.root = tk.Tk()
-        self.gui = ArmControlGUI(self.root)
+        self.gui = ArmControlGUI(
+            self.root, cartesian_chain=compact_tool_chain(URDF_PATH.read_text(encoding='utf-8'))
+        )
+        self.native_joint_pub = self.gui.joint_pub
+        self.native_speed_pub = self.gui.speed_pub
         self.gui.joint_pub = RecordingPublisher()
         self.gui.speed_pub = RecordingPublisher()
         self.gui.estop_pub = RecordingPublisher()
@@ -66,6 +87,13 @@ class TkControlTests(unittest.TestCase):
                 yield from descendants(child)
         return next(widget for widget in descendants(self.root)
                     if isinstance(widget, tk.Button) and widget.cget('text') == text)
+
+    def test_stop_button_always_stops_and_reset_is_separate(self):
+        stop = self.button('⛔ EMERGENCY STOP')
+        stop.invoke()
+        stop.invoke()
+        self.button('Reset E-stop').invoke()
+        self.assertEqual([msg.data for msg in self.gui.estop_pub.messages], [True, True, False])
 
     def test_home_button_wins_over_a_running_drag_worker(self):
         gui = self.gui
@@ -168,6 +196,95 @@ class TkControlTests(unittest.TestCase):
                     self.assertEqual(solves, [])
                     if control == 'Home':
                         self.assertEqual(gui.target_positions, list(HOME_DEGREES))
+
+    def test_downward_canvas_drag_reaches_simulated_rviz_tool_frame(self):
+        gui = self.gui
+        gui.joint_pub = RecordingPublisher(self.native_joint_pub)
+        gui.speed_pub = RecordingPublisher(self.native_speed_pub)
+        gui.speed_value.set(100)
+        servo = SimServoNode()
+        observer = rclpy.create_node('gui_tf_observer')
+        executor = SingleThreadedExecutor()
+        executor.add_node(servo)
+        executor.add_node(observer)
+        tf_buffer = Buffer()
+        listener = TransformListener(tf_buffer, observer)
+
+        try:
+            with TemporaryDirectory() as directory:
+                params_path = Path(directory) / 'robot-state.yaml'
+                params_path.write_text(yaml.safe_dump({
+                    '/**': {'ros__parameters': {
+                        'robot_description': URDF_PATH.read_text(encoding='utf-8')
+                    }},
+                }), encoding='utf-8')
+                executable = (
+                    Path(get_package_prefix('robot_state_publisher')) / 'lib'
+                    / 'robot_state_publisher' / 'robot_state_publisher'
+                )
+                publisher = subprocess.Popen(
+                    [str(executable), '--ros-args', '--params-file', str(params_path)],
+                    stdout=subprocess.DEVNULL,
+                )
+                try:
+                    self._check_downward_drag(executor, tf_buffer)
+                finally:
+                    publisher.terminate()
+                    try:
+                        publisher.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        publisher.kill()
+                        publisher.wait(timeout=3)
+        finally:
+            listener.unregister()
+            executor.shutdown()
+            observer.destroy_node()
+            servo.destroy_node()
+
+    def _check_downward_drag(self, executor, tf_buffer):
+        gui = self.gui
+
+        def wait_until(predicate):
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                self.root.update()
+                executor.spin_once(timeout_sec=0.01)
+                if predicate():
+                    return
+            self.fail('Simulated joints and tool TF did not converge before the deadline')
+
+        wait_until(lambda: gui._feedback_initialized and
+                   self.native_joint_pub.get_subscription_count() > 0 and
+                   self.native_speed_pub.get_subscription_count() > 0 and
+                   tf_buffer.can_transform('base_link', TOOL_LINK, Time()))
+        gui.hold_tool_pitch.set(True)
+        gui.tool_pitch_degrees.set(-90)
+        gui._set_cartesian_controls(95, 60, 25)
+        gui.toggle_auto_follow()
+        self.root.update()
+        viz = gui.viz_3d
+        x, y = map(round, viz.project_3d_to_2d(viz.target_x, viz.target_y, viz.target_z))
+        viz.canvas.event_generate('<ButtonPress-1>', x=x, y=y)
+        viz.canvas.event_generate('<B1-Motion>', x=x + 2, y=y)
+        viz.canvas.event_generate('<ButtonRelease-1>', x=x + 2, y=y)
+        target = (viz.target_x, viz.target_y, viz.target_z)
+        self.assertNotEqual(target, (0.095, 0.06, 0.025))
+
+        def tip_matches():
+            if not gui.joint_pub.messages or gui._drag_ik_running:
+                return False
+            try:
+                pose = tf_buffer.lookup_transform('base_link', TOOL_LINK, Time()).transform
+            except TransformException:
+                return False
+            tip = (pose.translation.x, pose.translation.y, pose.translation.z)
+            q = pose.rotation
+            return (math.dist(target, tip) < 0.003
+                    and tool_direction((q.x, q.y, q.z, q.w))[2] < -0.99
+                    and math.dist(viz.calculate_tool_tip(), tip) < 0.001)
+
+        wait_until(tip_matches)
+        self.assertEqual(len(viz.calculate_arm_positions()), 5)
 
     def test_realtime_checkbox_cancels_both_queued_update_paths(self):
         gui = self.gui

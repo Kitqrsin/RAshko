@@ -123,12 +123,12 @@ hardware grasp. The 120 mm plate gap is roughly 191 mm from the actual base
 rotation axis before cap-row setback, so the current arrangement needs a
 mechanical height/distance redesign before autonomous pickup.
 
-The GUI Cartesian drag control uses the original five-point geometric model in
-`ik_solver.py`. The canvas, orange target, point IK, and GUI forward kinematics
-all use that one model; fixed URDF/TF frame origins are never drawn as extra
-motor joints. Live joint feedback initializes the sliders and target through the
-same geometric FK. MoveIt and RViz keep using the URDF independently for motion
-planning and robot visualization.
+The GUI draws a lightweight five-joint schematic. The launcher extracts the
+joint transforms, limits, and tool-tip offset from the same URDF used by RViz.
+The canvas and Cartesian IK use that compact chain in `base_link`. Live joint
+feedback drives the schematic and the green tool-tip marker. Enable
+**Set tool pitch** to specify orientation while dragging or moving to an XYZ
+target. A pitch of `-90°` points down, `0°` is horizontal, and `+90°` points up.
 
 There is also a headless end-to-end test:
 
@@ -148,8 +148,9 @@ Cartesian orientation path for up, horizontal, and down poses:
 ```
 
 The test is bounded to 30 seconds and fails if simulated joint feedback, exact
-URDF forward kinematics, and the published `tool_tip` transform disagree. It is
-not the solver used by the GUI's mouse-drag target.
+URDF forward kinematics, and the published `tool_tip` transform disagree.
+CI also drives an actual Tk canvas drag and checks the simulated tool transform
+and canvas tip in a downward-facing pose.
 
 This is a kinematic/control simulation, not a force or torque simulator. It can
 find software, topic, launch, URDF, and IK faults; it cannot prove the real arm's
@@ -185,7 +186,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\raspberry.ps1
 
 Choose **Test every connection**. It checks the Docker engine and container,
 authenticates an SSH session to both Pi services, checks the camera health
-endpoint, and sends the existing authenticated UDP heartbeat. It never resets
+endpoint, and sends an authenticated UDP status request. It never resets
 E-stop, enables outputs, or sends a joint target. Continue commissioning only
 after the console reports `[READY]`.
 
@@ -208,9 +209,10 @@ GUI in a second terminal:
 
 `windows.ps1 EStop` and `ResetEStop` publish `true`/`false` on
 `/emergency_stop` when `udp_servo_bridge` is running, keeping the bridge's
-authenticated retry/latch state synchronized. If the bridge is not running,
-the commands fall back to a direct authenticated UDP request. Resetting the
-latch never enables outputs by itself; a later valid motion command can.
+authenticated stop state synchronized. E-stop can also go directly over UDP
+when the bridge is unavailable. Reset requires the running bridge. The Pi
+accepts motion only from the session that reset it, starting with the next
+valid joint command.
 
 Do the first physical test unloaded, at low speed, with a current-limited supply
 and a real power cutoff within reach.
@@ -245,6 +247,8 @@ estimates—the hobby servos still provide no measured shaft position.
 ## Useful commands
 
 ```text
+.\windows.ps1 Discover       auto-discover Pi on Ethernet and update .env.windows
+.\windows.ps1 SetPi          set RASHKO_PI_HOST or Ethernet adapter from CLI
 .\windows.ps1 Build          build the Docker image
 .\windows.ps1 Rebuild        rebuild image, recreate container, and build ROS
 .\windows.ps1 Start          start container and build the ROS workspace
@@ -272,8 +276,11 @@ estimates—the hobby servos still provide no measured shaft position.
 .\windows.ps1 Stop           stop the container
 .\docker-cleanup.ps1         report aggregate Docker usage without deleting data
 .\docker-cleanup.ps1 -Apply  prune old dangling images and dangling build cache
-.\raspberry-console.cmd Check verify every Windows-to-Pi connection safely
-.\raspberry-console.cmd Shell open an interactive Raspberry Pi Linux shell
+.\raspberry-console.cmd Check         verify every Windows-to-Pi connection safely
+.\raspberry-console.cmd Discover      auto-find Pi on Ethernet and save IP
+.\raspberry-console.cmd Ethernet      switch Windows Ethernet DHCP <-> Direct Static IP
+.\raspberry-console.cmd SyncAllowlist sync laptop Ethernet subnet to Pi allowlist
+.\raspberry-console.cmd Shell         open an interactive Raspberry Pi Linux shell
 ```
 
 The camera cap prototype is intentionally preview-only: it has no action client
@@ -289,5 +296,5 @@ executor do not provide those guarantees.
 
 See [instructions.md](instructions.md) for the operator startup, Pi-shell, and
 pre-motor checklist; [WINDOWS_RASPBERRY_SETUP.md](WINDOWS_RASPBERRY_SETUP.md)
-contains commissioning details, and [AGENTS.md](AGENTS.md) is the
-maintainer/LLM handoff contract.
+contains commissioning details, and [AGENTS.md](AGENTS.md) and
+[GEMINI.md](GEMINI.md) are the maintainer/LLM handoff contracts.

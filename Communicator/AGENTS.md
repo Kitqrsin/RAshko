@@ -20,7 +20,8 @@ This repository is the Raspberry-Pi-side runtime for the RAshko arm.
   selected for isolated commissioning.
 - Startup and every exception path must leave OE HIGH (outputs disabled).
 - E-stop is latched at startup and after watchdog expiry.
-- Heartbeats never enable outputs.
+- Status requests never change watchdog timing or motion ownership.
+- Only the session that reset E-stop can command motion or renew its watchdog.
 - Resetting E-stop does not enable outputs; a subsequent fresh, valid motion
   command is required.
 - Reject invalid commands. Never silently clamp them.

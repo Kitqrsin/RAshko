@@ -27,7 +27,7 @@ class Arm3DVisualization:
     JOINT_COLORS = ('#888888', '#6666aa', '#66aa66', '#aa6666', '#66aaaa')
     LINK_COLORS = ('#888888', '#666699', '#669966', '#996666')
     
-    def __init__(self, parent_frame, ik_solver, on_target_move_callback=None):
+    def __init__(self, parent_frame, ik_solver, on_target_move_callback=None, *, urdf_kinematics=None):
         """
         Initialize the 3D visualization.
         
@@ -39,6 +39,8 @@ class Arm3DVisualization:
         """
         self.parent = parent_frame
         self.ik_solver = ik_solver
+        self.urdf_kinematics = urdf_kinematics
+        self._pose_cache = None
         self.on_target_move = on_target_move_callback
         
         # Canvas dimensions
@@ -424,11 +426,13 @@ class Arm3DVisualization:
         positions = self.calculate_arm_positions()
         
         projected = [self.project_3d_to_2d(*position) for position in positions]
+        pose = self._urdf_pose()
+        projected_tip = self.project_3d_to_2d(*pose.position) if pose is not None else None
         item_ids = getattr(self, '_arm_item_ids', [])
 
         # Create the layer once. Subsequent frames only update coordinates,
         # avoiding delete/create traffic through Tk (and through X11 on Windows).
-        if not self._items_exist(item_ids, 9):
+        if not self._items_exist(item_ids, 9 + (projected_tip is not None)):
             item_ids = []
             # Draw links first (behind joints)
             for i in range(len(positions) - 1):
@@ -452,6 +456,11 @@ class Arm3DVisualization:
                     jx - radius, jy - radius, jx + radius, jy + radius,
                     fill=color, outline='#ffffff', width=1, tags='arm'
                 ))
+            if projected_tip is not None:
+                item_ids.append(self.canvas.create_line(
+                    *projected[-1], *projected_tip,
+                    fill='#66aaaa', width=4, arrow=tk.LAST, tags='arm',
+                ))
             self._arm_item_ids = item_ids
             return
 
@@ -467,14 +476,30 @@ class Arm3DVisualization:
                 item_ids[4 + i],
                 jx - radius, jy - radius, jx + radius, jy + radius,
             )
+        if projected_tip is not None:
+            self.canvas.coords(item_ids[-1], *projected[-1], *projected_tip)
+
+    def _urdf_pose(self):
+        model = getattr(self, 'urdf_kinematics', None)
+        if model is None:
+            return None
+        angles = tuple(self.joint_angles[:5])
+        if self._pose_cache is None or self._pose_cache[0] != angles:
+            radians = servo_degrees_to_radians((*angles, HOME_DEGREES[5]))[:5]
+            self._pose_cache = (angles, model.forward(radians))
+        return self._pose_cache[1]
+
+    def calculate_tool_tip(self):
+        pose = self._urdf_pose()
+        if pose is not None:
+            return tuple(float(value) for value in pose.position)
+        return self.calculate_arm_positions()[-1]
     
     def calculate_arm_positions(self):
-        """Return the original five-point geometric arm schematic.
-
-        The canvas and mouse IK intentionally share ``ArmIKSolver`` geometry.
-        Fixed URDF/TF frame origins are not motor joints and must never be
-        appended to this schematic.
-        """
+        """Return five motor origins without the fixed URDF frames."""
+        pose = self._urdf_pose()
+        if pose is not None:
+            return pose.joint_positions
 
         base_rad, shoulder_rad, elbow_rad, forearm_rad = (
             servo_degrees_to_radians(self.joint_angles)[:4]
@@ -584,13 +609,10 @@ class Arm3DVisualization:
         self.canvas.coords(item_ids[5], tx, ty - radius - 12)
     
     def draw_gripper_marker(self):
-        """Draw the gripper at the final point of the five-point schematic."""
-        positions = self.calculate_arm_positions()
-        if positions:
-            gripper_pos = positions[-1]
-            self.actual_gripper_x = gripper_pos[0]
-            self.actual_gripper_y = gripper_pos[1]
-            self.actual_gripper_z = gripper_pos[2]
+        """Draw the gripper marker at the Cartesian tool tip."""
+        self.actual_gripper_x, self.actual_gripper_y, self.actual_gripper_z = (
+            self.calculate_tool_tip()
+        )
         
         gx, gy = self.project_3d_to_2d(self.actual_gripper_x, self.actual_gripper_y, self.actual_gripper_z)
         
@@ -622,15 +644,8 @@ class Arm3DVisualization:
         Sync the target position to the current gripper position
         calculated from the arm's forward kinematics.
         """
-        # Use calculate_arm_positions to get actual gripper position
-        # This ensures consistency with how the arm is drawn
-        positions = self.calculate_arm_positions()
-        if len(positions) > 0:
-            end_pos = positions[-1]
-            self.target_x = end_pos[0]
-            self.target_y = end_pos[1]
-            self.target_z = end_pos[2]
-            self.update_position_label()
+        self.target_x, self.target_y, self.target_z = self.calculate_tool_tip()
+        self.update_position_label()
     
     def trigger_move_to_target(self):
         """Trigger the callback to move arm to target position"""

@@ -8,16 +8,11 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
+from arm_controller.pi_endpoint import default_camera_url
+
 
 def _default_camera_url():
-    configured = os.environ.get("RASHKO_CAMERA_URL", "").strip()
-    if configured:
-        return configured
-    host = os.environ.get("RASHKO_PI_HOST", "").strip()
-    if not host:
-        return ""
-    port = os.environ.get("RASHKO_CAMERA_PORT", "8080").strip() or "8080"
-    return f"http://{host}:{port}/stream.mjpg"
+    return default_camera_url()
 
 
 def generate_launch_description():

@@ -12,6 +12,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 .env.windows
+..env.windows.*.tmp
 
 # Local IDE and capture artifacts
 .vs/
